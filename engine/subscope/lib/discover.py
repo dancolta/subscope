@@ -1428,6 +1428,56 @@ def validate_sub_freshness(
     return result
 
 
+def _signal_tier(c: dict[str, Any]) -> int:
+    """Signal tier for a discovery candidate (used by the skip-validation path):
+    3 = a community Reddit's directory returned for the offer category or a
+    competitor; 2 = a thread-host sub strongly on-topic (vocab + competitor);
+    1 = a single weaker signal. Higher tiers rank above lower ones regardless of
+    raw frequency."""
+    d = bool(c.get("directory_match"))
+    v = bool(c.get("vocab_match"))
+    cm = bool(c.get("competitor_match"))
+    if d and (v or cm):
+        return 3
+    if v and cm:
+        return 2
+    return 1
+
+
+# Relevance bands per signal tier. The tier sets the band (non-overlapping, so a
+# directory community always reads above thread-host noise); the per-sub rank
+# score positions it WITHIN the band, so communities differentiate instead of
+# collapsing to one number. Ceilings stay under 100 (no Phase B fresh-intent proof).
+_RELEVANCE_BANDS = {3: (74, 96), 2: (52, 72), 1: (30, 50)}
+
+
+def _assign_relevance(shown: list[dict[str, Any]]) -> None:
+    """Set c['relevance'] (0-100) on each shown candidate, in place.
+
+    Within a tier, scale the candidate's rank score across that tier's observed
+    score range into the tier's band. A 0.30 floor keeps the weakest sub off the
+    band bottom so near-equal scores cluster instead of fanning to the extremes.
+    Noise-listed subs are dialed back afterward. This replaces the flat tier-floor
+    that collapsed every directory community to one number; the score already
+    encodes directory base + cross-query count + position + vocab + competitor +
+    thread corroboration, so relevance now reflects real signal strength.
+    """
+    by_tier: dict[int, list[float]] = {}
+    for c in shown:
+        by_tier.setdefault(_signal_tier(c), []).append(float(c.get("score", 0.0)))
+    for c in shown:
+        tier = _signal_tier(c)
+        b0, b1 = _RELEVANCE_BANDS[tier]
+        ss = by_tier[tier]
+        lo, hi = min(ss), max(ss)
+        frac_raw = (float(c.get("score", 0.0)) - lo) / (hi - lo) if hi > lo else 0.7
+        frac = 0.30 + 0.70 * frac_raw
+        rel = round(b0 + frac * (b1 - b0))
+        if c.get("noise_downranked"):
+            rel = int(rel * 0.6)
+        c["relevance"] = max(0, min(100, rel))
+
+
 def compute_confidence(
     *,
     freq: int,
@@ -1697,15 +1747,6 @@ def discover_subs_for_profile(
         # a pain word) has neither signal and is dropped here. This is what
         # Phase B used to filter; skipping Phase B without this gate let garbage
         # subs rank high (the QA regression).
-        def _signal_tier(c: dict[str, Any]) -> int:
-            d = bool(c.get("directory_match"))
-            v = bool(c.get("vocab_match"))
-            cm = bool(c.get("competitor_match"))
-            if d and (v or cm):
-                return 3   # a community Reddit's directory returned for the category/competitor
-            if v and cm:
-                return 2   # thread-host sub strongly on-topic (vocab + competitor)
-            return 1       # single weak signal
         signaled = [c for c in phase_a_candidates
                     if c.get("vocab_match") or c.get("competitor_match")
                     or c.get("directory_match")]
@@ -1727,37 +1768,21 @@ def discover_subs_for_profile(
         # Rank by signal tier first, then score, so confirmed category / competitor
         # communities top the list ahead of thread-host frequency noise.
         signaled.sort(key=lambda c: (_signal_tier(c), c.get("score", 0.0)), reverse=True)
-        freq_max = max((c.get("freq", 0) for c in signaled), default=0)
-        subs_out = []
-        for c in signaled[:MAX_SUBS_RETURNED]:
-            # Honest 0-100 via compute_confidence (NOT score/batch-max, which
-            # always paints the top sub 100 even if it is weak). No Phase B means
-            # no fresh-intent evidence, so the score carries an honest ceiling.
-            rel = compute_confidence(
-                freq=c.get("freq", 0),
-                freq_max=freq_max,
-                vocab_match=bool(c.get("vocab_match")),
-                weighted_relevance=3.0 if c.get("competitor_match") else 1.0,
-                fresh_buyer_intent_count=0,
-                is_noise=bool(c.get("noise_downranked")),
-            )
-            # Floor a directory community match above thread-host frequency noise:
-            # Reddit's own directory returning the sub for the category or a
-            # competitor is the strongest "the ICP lives here" signal we have
-            # without Phase B. Noise-listed subs are then dialed back down.
-            rel = max(rel, {3: 72, 2: 50, 1: 0}[_signal_tier(c)])
-            if c.get("noise_downranked"):
-                rel = int(rel * 0.6)
-            subs_out.append({
-                "name": c["name"],
-                "relevance": rel,
-                "score": round(c.get("score", 0.0), 2),
-                "why": c.get("why", ""),
-                "thread_count": c.get("thread_count", 0),
-                "sources": c.get("sources", []),
-                "noise_downranked": c.get("noise_downranked", False),
-                "validation_skipped": True,
-            })
+        shown = signaled[:MAX_SUBS_RETURNED]
+        # Differentiated relevance: signal tier sets the band, the per-sub rank
+        # score sets the position within it (see _assign_relevance). Replaces the
+        # flat tier-floor that made every directory community read the same number.
+        _assign_relevance(shown)
+        subs_out = [{
+            "name": c["name"],
+            "relevance": c["relevance"],
+            "score": round(c.get("score", 0.0), 2),
+            "why": c.get("why", ""),
+            "thread_count": c.get("thread_count", 0),
+            "sources": c.get("sources", []),
+            "noise_downranked": c.get("noise_downranked", False),
+            "validation_skipped": True,
+        } for c in shown]
         subs_out.sort(key=lambda s: s["relevance"], reverse=True)
         return {
             "subs": subs_out,

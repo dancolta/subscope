@@ -1214,6 +1214,37 @@ def test_audience_industry_nouns_skips_prepositions():
     assert "serving" not in nouns
 
 
+def test_skip_validation_relevance_differentiates():
+    # The bug: every directory community got floored to the same number (72).
+    # Now same-tier subs with different rank scores get different relevance.
+    shown = [
+        {"name": "projectmanagement", "score": 14.5, "vocab_match": True, "competitor_match": False, "directory_match": True, "freq": 2},
+        {"name": "Asana", "score": 14.0, "vocab_match": False, "competitor_match": True, "directory_match": True, "freq": 1},
+        {"name": "consulting", "score": 11.5, "vocab_match": True, "competitor_match": False, "directory_match": True, "freq": 1},
+        {"name": "projectmanagers", "score": 11.2, "vocab_match": True, "competitor_match": False, "directory_match": True, "freq": 1},
+    ]
+    discover._assign_relevance(shown)
+    rels = [c["relevance"] for c in shown]
+    assert len(set(rels)) > 1                       # NOT all identical
+    assert all(74 <= r <= 96 for r in rels)         # tier-3 band, honest sub-100 ceiling
+    pm = next(c for c in shown if c["name"] == "projectmanagement")
+    pmgrs = next(c for c in shown if c["name"] == "projectmanagers")
+    assert pm["relevance"] > pmgrs["relevance"]     # higher rank score -> higher relevance
+
+
+def test_skip_validation_directory_outranks_thread_noise():
+    # A tier-3 directory community must read higher than a tier-2 thread-host sub
+    # even when the thread sub has a higher raw score.
+    shown = [
+        {"name": "projectmanagement", "score": 12.0, "vocab_match": True, "competitor_match": False, "directory_match": True, "freq": 1},
+        {"name": "SideProject", "score": 18.0, "vocab_match": True, "competitor_match": True, "directory_match": False, "freq": 3},
+    ]
+    discover._assign_relevance(shown)
+    pm = next(c for c in shown if c["name"] == "projectmanagement")
+    sp = next(c for c in shown if c["name"] == "SideProject")
+    assert pm["relevance"] > sp["relevance"]
+
+
 if __name__ == "__main__":
     import subprocess
     sys.exit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))
