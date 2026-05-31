@@ -107,7 +107,7 @@ You will not see a single scored post until the flow ends. That is the tradeoff 
 2. **What do you sell?** One line.
 3. **Who buys it?** A job title is enough.
 4. **What is the pain?** A real customer quote is gold. Paraphrase is fine.
-5. **Confirm the scan card.** What you sell, buyers, pain pattern, competitor list, and recommended subreddits, each with a confidence score and a clickable link to a real buyer thread from the last 7 days. Reply `go`, or tell the flow what to fix.
+5. **Confirm the targeting card.** What you sell, buyers, pain pattern, competitor list, and recommended subreddits, each with a relevance score. You are confirming the sub names; the first scan validates them by actually surfacing. Reply `go`, or tell the flow what to fix.
 6. **Connect integrations (optional).** One menu: DataForSEO, Firecrawl, Notion, Slack, Obsidian. Reply `skip` for any or all.
 7. **First scan runs.**
 
@@ -116,24 +116,16 @@ The flow writes config to `~/.config/subscope/` (subreddits, keywords, brand-anc
 </details>
 
 <details>
-<summary>How subscope picks your subreddits, with receipts</summary>
+<summary>How subscope picks your subreddits</summary>
 
-When you onboard, subscope does not hand you a generic list of r/SaaS and r/Entrepreneur. It hands you a list of people asking for what you sell, with the evidence.
+When you onboard, subscope does not hand you a generic list of r/SaaS and r/Entrepreneur. It searches Reddit for people discussing what you sell and scores each community by how well it fits your offer.
 
 1. **Live search, not a template.** subscope searches Reddit in real time using your own pain phrasing and your competitors' brand names. Two people selling different things get different subreddits.
-2. **A real buyer thread, dated, on every result.** A subreddit only makes the list if it has a genuine buyer thread from the last 7 days, with a direct link and an absolute timestamp. A subreddit name is a guess. A live buyer thread is evidence.
+2. **A relevance score, and a real offer signal required.** Each candidate gets a 0-100 relevance score. A subreddit only makes the list if it carries a genuine offer signal: your category vocabulary, or one of your competitors named in its threads. Communities that merely share a generic word ("alternative", a pricing gripe) are dropped, not ranked.
 3. **Claude reviews every candidate.** A keyword pass finds candidates, then Claude (running the plugin) reads each one and drops the false positives keyword matching cannot catch: career questions ("Software Engineering vs Dentistry"), self-promoters, and brand-name collisions (the law tool "Clio" vs the Renault "Clio").
-4. **A reason + a confidence score.** Each result tells you why it was picked and how much to trust it:
+4. **The list is where it looks first, not a fence.** Every `/subscope-run` judges each post against your offer, so a strong buyer in a community you did not list still surfaces. The first scan is what proves a sub, by actually surfacing one.
 
-   ```
-   [64] r/LawFirm   buyer post 2026-05-28 07:29 UTC
-        "Best tool for document parsing?"
-        Buyer post 14h ago. Someone asking about a "tool" with buying intent ("best").
-   ```
-
-**Verify it yourself.** Click the thread link on any recommendation. If it is not a real person shopping for what you sell, the tool failed. That is the bar.
-
-**Precision over volume, on purpose.** In a narrow niche you might see one to three subreddits, or "no active buyer this week." That honest result beats padding the list with noise.
+**Precision over volume, on purpose.** In a narrow niche you might see one to three subreddits, or an honest "no clearly relevant communities yet, what vertical are you in?" That beats padding the list with noise.
 
 </details>
 
