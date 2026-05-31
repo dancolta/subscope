@@ -132,6 +132,26 @@ FRESHNESS_CUTOFF_DAYS = 730
 # operator-token list (which had no awareness of who the buyer actually is).
 USER_VOCAB_BONUS = 2.5
 
+# ─── Subreddit-directory discovery (recall) ────────────────────────────
+# Thread-host extraction (search.rss over POSTS) finds subs where a phrase like
+# "asana alternative" was posted, which skews to indie / maker / self-host subs,
+# not the category community the ICP actually lives in. Searching Reddit's
+# SUBREDDIT directory for the offer's category nouns plus competitor names
+# surfaces the real communities (r/projectmanagement, r/agency, r/consulting).
+# These constants score a directory hit relative to the thread-frequency signal.
+DIRECTORY_BASE = 8.0                # base score for a Reddit-recognized community match
+DIRECTORY_QUERY_WEIGHT = 3.0        # each ADDITIONAL category query that surfaced the sub
+COMPETITOR_COMMUNITY_BONUS = 5.0    # the sub IS a competitor's own community (r/<brand>)
+MAX_SUB_QUERIES = 8                 # cap on subreddit-directory queries per discovery
+# Suffixes a competitor's own community sub may carry after the brand token, so
+# r/ClickUpApp counts as ClickUp's community but r/AsAnAlly (asana + "lly") does
+# not. Empty string allows the exact brand sub (r/Asana).
+_COMMUNITY_SUFFIXES = {"", "app", "hq", "official", "community", "users", "io", "crm", "pm"}
+# Same, minus the empty string, for de-dotted brand bases (so r/mondaydotcom
+# matches Monday.com via base "monday" + "dotcom", but the bare r/monday weekday
+# sub does NOT match via an empty suffix).
+_NONEMPTY_COMMUNITY_SUFFIXES = {"app", "hq", "official", "community", "users", "io", "crm", "pm", "dotcom"}
+
 # Generic vocabulary stopwords stripped from token overlap.
 # Conservative list: ONLY true linguistic stopwords + the most generic
 # nouns. Domain-meaningful words like "saas", "alternatives", "expensive"
@@ -176,6 +196,14 @@ NOISE_DOWNRANK_SUBS = {
     "aitah", "amitheasshole", "amioverreacting", "relationships",
     "relationship_advice", "bestofredditorupdates", "tifu",
     "twoxchromosomes", "askmen", "askwomen", "futurology",
+    # (e) indie-maker / build-in-public / promo subs. "X alternative" and
+    # "replacing X" threads get POSTED here by makers, so thread-host extraction
+    # over-surfaces them, but the ICP buying the tool is not here. (caught in the
+    # Teamwork discovery QA: r/SideProject, r/BuyFromEU, r/buildinpublic topped
+    # the list ahead of r/projectmanagement.)
+    "sideproject", "sideprojects", "buildinpublic", "indiehackers", "indiebiz",
+    "indiedev", "entrepreneurs", "sidehustle", "juststart", "growmybusiness",
+    "buyfromeu", "buyitforlife", "alphaandbetausers", "roastmystartup",
 }
 
 # Buyer-intent signal: a thread is dropped from discovery if its title contains
@@ -246,6 +274,9 @@ def _has_buyer_intent(title: str, body: str = "") -> bool:
 # Reddit sub-name rule: alphanumerics + underscore, 2-21 chars.
 _SUBNAME_RE = re.compile(r"^[A-Za-z0-9_]{2,21}$")
 
+# Subreddit-search Atom <link href>: https://www.reddit.com/r/<name>/
+_SR_LINK_RE = re.compile(r"/r/([A-Za-z0-9_]{2,21})/?", re.IGNORECASE)
+
 # DFS SERP harvest: r/<sub>/comments/<id>/...
 _DFS_SUB_RE = re.compile(r"reddit\.com/r/([A-Za-z0-9_]{2,21})/comments/", re.IGNORECASE)
 
@@ -271,6 +302,21 @@ _BUYER_STOPWORDS = {
     "with", "people", "person", "user", "users", "team", "teams",
     "company", "companies", "business", "businesses",
 }
+
+# Role / seniority words stripped when mining single-token audience queries from
+# who_to_reach (so "agencies" and "consulting" become directory queries but
+# "managers" / "leads" / "planners" do not).
+_ROLE_STOPWORDS = {
+    "manager", "managers", "lead", "leads", "leader", "leaders", "planner",
+    "planners", "director", "directors", "owner", "owners", "head", "heads",
+    "team", "teams", "firm", "firms", "company", "companies", "people",
+    "staff", "professional", "professionals", "rep", "reps", "specialist",
+    "specialists", "executive", "executives", "founder", "founders",
+}
+
+# Prepositions/connectors that can leak into the greedy industry-noun capture
+# tail (e.g. "... at agencies serving healthcare") and must not become queries.
+_AUDIENCE_PREP_SKIP = {"serving", "across", "within", "through"}
 
 # Leading prefixes to strip from the verbatim T4 pain.
 _T4_LEADING_PREFIXES = ("i'm ", "i am ", "we're ", "we are ", "my ", "our ", "the ")
@@ -704,6 +750,83 @@ def derive_queries(
     return out
 
 
+def _audience_industry_nouns(text: str) -> list[str]:
+    """Pull industry / vertical nouns from who-you-reach.
+
+    The industry context usually follows a preposition: "PMs AT agencies",
+    "ops leads IN consulting firms". Those nouns (agencies, consulting) are the
+    community-category words that map to real subreddits, unlike the role words
+    that come before them (managers, leads). Returns deduped lowercase nouns in
+    order of appearance.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"\b(?:at|in|serving|for|across|within)\s+([a-z][\w\s,&\-]{2,70})",
+                         (text or "").lower()):
+        for tok in re.findall(r"[a-z][a-z\-]{4,}", m.group(1)):
+            if (tok in _ROLE_STOPWORDS or tok in _VOCAB_STOPWORDS
+                    or tok in _BUYER_STOPWORDS or tok in _AUDIENCE_PREP_SKIP
+                    or tok in seen):
+                continue
+            seen.add(tok)
+            out.append(tok)
+    return out
+
+
+def derive_sub_queries(
+    answers: dict[str, str],
+    competitors: list[str] | None = None,
+    vertical: str | None = None,
+    max_queries: int = MAX_SUB_QUERIES,
+) -> list[str]:
+    """Build category/audience/competitor queries for the SUBREDDIT-directory search.
+
+    Unlike derive_queries (which builds "X alternative" THREAD searches), this asks
+    Reddit which COMMUNITIES match the offer's category, the buyer's industry, and
+    each competitor's own community. That is what surfaces r/projectmanagement,
+    r/agency, r/consulting and r/<competitor> instead of the indie / maker subs
+    where "X alternative" threads happen to get posted. Priority order guarantees
+    the highest-recall queries (competitors + industry nouns + the lead category
+    phrase) make the cap before lower-signal phrases fill the rest.
+    """
+    competitors = competitors or []
+    t2 = answers.get("what_offering") or ""
+    t3 = answers.get("who_to_reach") or ""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(q: str) -> None:
+        q = (q or "").strip().lower()
+        if not q or len(q) < 3 or q in seen or len(out) >= max_queries:
+            return
+        seen.add(q)
+        out.append(q)
+
+    comp_q = [(c or "").strip().lower().split(".")[0] for c in competitors[:3]]
+    comp_q = [c for c in comp_q if c]
+    industry = _audience_industry_nouns(t3)
+    off_phrases = _extract_noun_phrases(t2)
+    aud_phrases = _extract_noun_phrases(t3)
+
+    for q in comp_q[:2]:
+        add(q)
+    for q in industry[:2]:
+        add(q)
+    for q in off_phrases[:1]:
+        add(q)
+    if vertical and vertical.strip().lower() != "general":
+        add(vertical)
+    for q in off_phrases[1:2]:
+        add(q)
+    for q in aud_phrases[:1]:
+        add(q)
+    for q in industry[2:3]:
+        add(q)
+    for q in comp_q[2:3]:
+        add(q)
+    return out[:max_queries]
+
+
 def _extract_noun_phrases(text: str) -> list[str]:
     """Pull 2-3 word noun phrases from T4 / T2 free text.
 
@@ -800,6 +923,51 @@ def search_reddit(query: str, sleep_between: float = 0.5) -> list[dict[str, Any]
     return threads
 
 
+def search_subreddits(query: str, limit: int = 12,
+                      sleep_between: float = 0.3) -> list[dict[str, Any]]:
+    """Reddit SUBREDDIT-directory search via RSS (keyless).
+
+    Returns the COMMUNITIES whose name/description match a category term, not the
+    threads matching a phrase. This is the recall source that surfaces
+    r/projectmanagement / r/agency / r/<competitor>, which thread-host extraction
+    misses. Each hit: {sub, display_title, rank_pos, source_query,
+    source: "subreddit_search"}. The sub name is taken from the entry link
+    (/r/<name>/), the only reliable source (the <title> is a display name).
+    Shares the global per-IP throttle via fetch_xml_resilient.
+    """
+    if not query:
+        return []
+    encoded = urllib.parse.quote(query)
+    path = f"/subreddits/search.rss?q={encoded}&limit={int(limit)}"
+    root = reddit.fetch_xml_resilient(path, timeout=12)
+    if root is None:
+        return []
+    ns = "{http://www.w3.org/2005/Atom}"
+    hits: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pos, entry in enumerate(root.findall(f"{ns}entry")):
+        link_el = entry.find(f"{ns}link")
+        href = link_el.get("href", "") if link_el is not None else ""
+        m = _SR_LINK_RE.search(href)
+        if not m:
+            continue
+        sub = m.group(1)
+        key = sub.lower()
+        if not _SUBNAME_RE.match(sub) or key in seen:
+            continue
+        seen.add(key)
+        hits.append({
+            "sub": sub,
+            "display_title": (entry.findtext(f"{ns}title") or "").strip(),
+            "rank_pos": pos,
+            "source_query": query,
+            "source": "subreddit_search",
+        })
+    if sleep_between > 0:
+        time.sleep(sleep_between)
+    return hits
+
+
 def search_dfs(query: str, conn) -> list[dict[str, Any]]:
     """site:reddit.com SERP via DataForSEO. Empty when DFS not configured.
 
@@ -854,7 +1022,8 @@ def search_dfs(query: str, conn) -> list[dict[str, Any]]:
 
 def rank_subs(threads: list[dict[str, Any]],
               user_vocab: set[str] | None = None,
-              comp_tokens: set[str] | None = None) -> list[dict[str, Any]]:
+              comp_tokens: set[str] | None = None,
+              directory_hits: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Aggregate threads per subreddit, score, sort desc by final_score.
 
     Args:
@@ -969,6 +1138,80 @@ def rank_subs(threads: list[dict[str, Any]],
             "sources": sorted({t.get("source", "") for t in ts}),
             "noise_downranked": noise_mult < 1.0,
         })
+
+    # ─── Directory pass: fold in subreddit-search community matches ─────────
+    # These are subs Reddit's own directory returned for the offer's category /
+    # audience / competitor queries. They carry no threads, so they bypass the
+    # thread-count and cross-query gates and earn their score from the directory
+    # signal instead. A directory hit needs a relevance signal (name/title shares
+    # the user's vocab, or it is a competitor community) OR an existing thread
+    # entry; pure off-topic junk (r/labrador for "professional services") is
+    # dropped here, and residual semantic noise is dropped by the skill review.
+    if directory_hits:
+        by_key = {r["name"].lower(): r for r in ranked}
+        grouped: dict[str, dict[str, Any]] = {}
+        for h in directory_hits:
+            sub = (h.get("sub") or "").strip()
+            if not sub or not _SUBNAME_RE.match(sub):
+                continue
+            k = sub.lower()
+            g = grouped.setdefault(k, {"name": sub, "queries": set(),
+                                       "pos_min": 99, "title": ""})
+            g["queries"].add(h.get("source_query", ""))
+            g["pos_min"] = min(g["pos_min"], int(h.get("rank_pos", 99)))
+            if h.get("display_title") and not g["title"]:
+                g["title"] = h["display_title"]
+        for k, g in grouped.items():
+            name_title = (k + " " + (g["title"] or "")).lower()
+            vocab_hit = bool(user_vocab) and (
+                _sub_matches_user_vocab(k, user_vocab)
+                or any(tok in name_title for tok in user_vocab))
+            # Competitor COMMUNITY match must be tight: the sub IS the brand's
+            # community (r/Asana), not merely a sub whose name contains the brand
+            # token (r/ASANA_stock, r/asana_fan_theories). Require exact match or
+            # a very short suffix.
+            comp_hit = bool(comp_tokens) and any(
+                k == ct
+                or (len(ct) >= 4 and k.startswith(ct) and k[len(ct):] in _COMMUNITY_SUFFIXES)
+                or (base != ct and len(base) >= 4 and k.startswith(base)
+                    and k[len(base):] in _NONEMPTY_COMMUNITY_SUFFIXES)
+                for ct in comp_tokens for base in (ct.split(".")[0],))
+            existing = by_key.get(k)
+            if not (vocab_hit or comp_hit or existing):
+                continue  # off-topic directory noise, no offer signal
+            ndq = len(g["queries"])
+            pos_bonus = max(0.0, (10 - min(g["pos_min"], 10)) / 10.0)
+            dir_score = (
+                DIRECTORY_BASE
+                + DIRECTORY_QUERY_WEIGHT * (ndq - 1)
+                + pos_bonus
+                + (USER_VOCAB_BONUS if vocab_hit else 0.0)
+                + (COMPETITOR_COMMUNITY_BONUS if comp_hit else 0.0)
+            )
+            if k in NOISE_DOWNRANK_SUBS:
+                dir_score *= NOISE_DOWNRANK_FACTOR
+            if existing:
+                existing["score"] = round(existing["score"] + dir_score, 3)
+                existing["directory_match"] = True
+                existing["vocab_match"] = existing.get("vocab_match") or vocab_hit
+                existing["competitor_match"] = existing.get("competitor_match") or comp_hit
+                existing["sources"] = sorted(set(existing.get("sources", [])) | {"subreddit_search"})
+            else:
+                by_key[k] = {
+                    "name": g["name"],
+                    "score": round(dir_score, 3),
+                    "why": ("competitor community" if comp_hit else
+                            "community match for '%s'"
+                            % (max(g["queries"], key=len) if g["queries"] else "")),
+                    "thread_count": 0,
+                    "freq": ndq,
+                    "vocab_match": vocab_hit,
+                    "competitor_match": comp_hit,
+                    "directory_match": True,
+                    "sources": ["subreddit_search"],
+                    "noise_downranked": k in NOISE_DOWNRANK_SUBS,
+                }
+        ranked = list(by_key.values())
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
     # v3: return up to PHASE_A_CANDIDATE_CAP (12); Phase B validates + final-trims to 8
@@ -1185,6 +1428,56 @@ def validate_sub_freshness(
     return result
 
 
+def _signal_tier(c: dict[str, Any]) -> int:
+    """Signal tier for a discovery candidate (used by the skip-validation path):
+    3 = a community Reddit's directory returned for the offer category or a
+    competitor; 2 = a thread-host sub strongly on-topic (vocab + competitor);
+    1 = a single weaker signal. Higher tiers rank above lower ones regardless of
+    raw frequency."""
+    d = bool(c.get("directory_match"))
+    v = bool(c.get("vocab_match"))
+    cm = bool(c.get("competitor_match"))
+    if d and (v or cm):
+        return 3
+    if v and cm:
+        return 2
+    return 1
+
+
+# Relevance bands per signal tier. The tier sets the band (non-overlapping, so a
+# directory community always reads above thread-host noise); the per-sub rank
+# score positions it WITHIN the band, so communities differentiate instead of
+# collapsing to one number. Ceilings stay under 100 (no Phase B fresh-intent proof).
+_RELEVANCE_BANDS = {3: (74, 96), 2: (52, 72), 1: (30, 50)}
+
+
+def _assign_relevance(shown: list[dict[str, Any]]) -> None:
+    """Set c['relevance'] (0-100) on each shown candidate, in place.
+
+    Within a tier, scale the candidate's rank score across that tier's observed
+    score range into the tier's band. A 0.30 floor keeps the weakest sub off the
+    band bottom so near-equal scores cluster instead of fanning to the extremes.
+    Noise-listed subs are dialed back afterward. This replaces the flat tier-floor
+    that collapsed every directory community to one number; the score already
+    encodes directory base + cross-query count + position + vocab + competitor +
+    thread corroboration, so relevance now reflects real signal strength.
+    """
+    by_tier: dict[int, list[float]] = {}
+    for c in shown:
+        by_tier.setdefault(_signal_tier(c), []).append(float(c.get("score", 0.0)))
+    for c in shown:
+        tier = _signal_tier(c)
+        b0, b1 = _RELEVANCE_BANDS[tier]
+        ss = by_tier[tier]
+        lo, hi = min(ss), max(ss)
+        frac_raw = (float(c.get("score", 0.0)) - lo) / (hi - lo) if hi > lo else 0.7
+        frac = 0.30 + 0.70 * frac_raw
+        rel = round(b0 + frac * (b1 - b0))
+        if c.get("noise_downranked"):
+            rel = int(rel * 0.6)
+        c["relevance"] = max(0, min(100, rel))
+
+
 def compute_confidence(
     *,
     freq: int,
@@ -1361,7 +1654,7 @@ def discover_subs_for_profile(
     providers = enrich.detect_providers()
     dfs_available = providers.get("dataforseo", False)
     threads: list[dict[str, Any]] = []
-    source_mix = {"dfs": 0, "reddit_native": 0}
+    source_mix = {"dfs": 0, "reddit_native": 0, "subreddit_search": 0}
     any_provider_responded = False
 
     for q in queries:
@@ -1393,15 +1686,34 @@ def discover_subs_for_profile(
             except Exception as e:
                 _log(f"dfs search error for '{q}': {type(e).__name__}")
 
+    # Subreddit-directory recall (the fix for "discovery returns the wrong subs"):
+    # ask Reddit which COMMUNITIES match the category / audience / competitors. This
+    # surfaces r/projectmanagement, r/agency, r/<competitor> that thread-host
+    # extraction misses. Runs after the thread loop so it shares the deadline.
+    directory_hits: list[dict[str, Any]] = []
+    for sq in derive_sub_queries(answers, competitors, vertical=vertical):
+        if time.time() > deadline:
+            break
+        try:
+            hits = search_subreddits(sq, sleep_between=0.3)
+            if hits:
+                any_provider_responded = True
+            directory_hits.extend(hits)
+            source_mix["subreddit_search"] += len(hits)
+        except Exception as e:
+            _log(f"subreddit search error for '{sq}': {type(e).__name__}")
+
     user_vocab = _build_user_vocabulary(answers)
     comp_tokens = _build_competitor_tokens(competitors)
-    phase_a_candidates = rank_subs(threads, user_vocab=user_vocab, comp_tokens=comp_tokens)
+    phase_a_candidates = rank_subs(threads, user_vocab=user_vocab,
+                                   comp_tokens=comp_tokens, directory_hits=directory_hits)
     phase_a_count = len(phase_a_candidates)
 
     discovery_unreachable = (
         not any_provider_responded
         and source_mix["reddit_native"] == 0
         and source_mix["dfs"] == 0
+        and source_mix["subreddit_search"] == 0
     )
 
     # Phase A produced nothing, escalate to vertical clarifier (or report unreachable)
@@ -1436,7 +1748,8 @@ def discover_subs_for_profile(
         # Phase B used to filter; skipping Phase B without this gate let garbage
         # subs rank high (the QA regression).
         signaled = [c for c in phase_a_candidates
-                    if c.get("vocab_match") or c.get("competitor_match")]
+                    if c.get("vocab_match") or c.get("competitor_match")
+                    or c.get("directory_match")]
         if not signaled:
             # Nothing with a real offer signal: ask for the vertical rather than
             # show freq-only noise (or nothing). Mirrors the empty-Phase-A path.
@@ -1452,30 +1765,24 @@ def discover_subs_for_profile(
                 "phase_a_count": phase_a_count,
                 "validation_skipped": True,
             }
-        freq_max = max((c.get("freq", 0) for c in signaled), default=0)
-        subs_out = []
-        for c in signaled[:MAX_SUBS_RETURNED]:
-            # Honest 0-100 via compute_confidence (NOT score/batch-max, which
-            # always paints the top sub 100 even if it is weak). No Phase B means
-            # no fresh-intent evidence, so the score carries an honest ceiling.
-            rel = compute_confidence(
-                freq=c.get("freq", 0),
-                freq_max=freq_max,
-                vocab_match=bool(c.get("vocab_match")),
-                weighted_relevance=3.0 if c.get("competitor_match") else 1.0,
-                fresh_buyer_intent_count=0,
-                is_noise=bool(c.get("noise_downranked")),
-            )
-            subs_out.append({
-                "name": c["name"],
-                "relevance": rel,
-                "score": round(c.get("score", 0.0), 2),
-                "why": c.get("why", ""),
-                "thread_count": c.get("thread_count", 0),
-                "sources": c.get("sources", []),
-                "noise_downranked": c.get("noise_downranked", False),
-                "validation_skipped": True,
-            })
+        # Rank by signal tier first, then score, so confirmed category / competitor
+        # communities top the list ahead of thread-host frequency noise.
+        signaled.sort(key=lambda c: (_signal_tier(c), c.get("score", 0.0)), reverse=True)
+        shown = signaled[:MAX_SUBS_RETURNED]
+        # Differentiated relevance: signal tier sets the band, the per-sub rank
+        # score sets the position within it (see _assign_relevance). Replaces the
+        # flat tier-floor that made every directory community read the same number.
+        _assign_relevance(shown)
+        subs_out = [{
+            "name": c["name"],
+            "relevance": c["relevance"],
+            "score": round(c.get("score", 0.0), 2),
+            "why": c.get("why", ""),
+            "thread_count": c.get("thread_count", 0),
+            "sources": c.get("sources", []),
+            "noise_downranked": c.get("noise_downranked", False),
+            "validation_skipped": True,
+        } for c in shown]
         subs_out.sort(key=lambda s: s["relevance"], reverse=True)
         return {
             "subs": subs_out,
@@ -1505,12 +1812,9 @@ def discover_subs_for_profile(
     dropped: list[dict[str, Any]] = []
     timed_out_subs: list[str] = []
 
-    # Determine batch-level normalization base for confidence (max freq seen)
-    freq_max = max((c.get("thread_count", 0) for c in phase_a_candidates), default=1) or 1
-    # Actually use freq (distinct query count) not thread_count
-    candidate_freqs = []
-    # We need freq per candidate but rank_subs didn't expose it; recompute from threads
-    # Build a quick freq lookup from the original threads bucket
+    # Batch-level normalization base for confidence: max distinct-query freq.
+    # rank_subs does not expose freq on the candidate dicts, so recompute it per
+    # sub from the original threads bucket.
     sub_to_queries: dict[str, set[str]] = {}
     for t in threads:
         s = (t.get("sub") or "").strip().lower()

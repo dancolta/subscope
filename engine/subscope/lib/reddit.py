@@ -73,6 +73,13 @@ MIN_REQUEST_INTERVAL = 1.6
 RATELIMIT_REMAINING_FLOOR = 2.0
 MAX_RATELIMIT_PAUSE = 60.0
 
+# Reddit search `q` safe cap. Longer queries are truncated at a word boundary
+# before URL-encoding (search.rss rejects over-long queries). Allowlists keep
+# caller-supplied sort/timeframe values off the URL unless they are valid.
+QUERY_MAX_LEN = 512
+_SEARCH_SORTS = ("new", "top", "relevance", "hot", "comments")
+_SEARCH_TIMEFRAMES = ("hour", "day", "week", "month", "year", "all")
+
 # Atom namespace used by Reddit RSS feeds.
 _ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
@@ -600,6 +607,69 @@ def fetch_feed(url: str, timeout: int = 15) -> list[dict[str, Any]] | None:
     return posts
 
 
+def _normalize_sub(sub: str) -> str:
+    """Strip an optional 'r/' or '/r/' prefix and surrounding slashes/space.
+
+    NOT lstrip('r/'): that strips every leading 'r' and '/' as a character class,
+    mangling subs that start with 'r' (rails -> ails, recruiting -> ecruiting).
+    Callers URL-encode the result with quote(safe='') so '/' and '.' cannot escape
+    the path segment.
+    """
+    s = (sub or "").strip()
+    if s.startswith("/r/"):
+        s = s[3:]
+    elif s.startswith("r/"):
+        s = s[2:]
+    return s.strip("/").strip()
+
+
+def fetch_search(
+    sub: str | None,
+    query: str,
+    *,
+    sort: str = "new",
+    t: str | None = None,
+    limit: int = 25,
+    restrict_sr: bool = True,
+    timeout: int = 12,
+) -> list[dict[str, Any]] | None:
+    """Keyless Reddit search via search.rss. Within-sub when `sub` is set and
+    restrict_sr is True, global search otherwise.
+
+    Returns normalized posts (the same parse_atom_entry shape fetch_feed emits),
+    [] for a reachable-but-empty feed, and None when the feed is UNREACHABLE, so
+    callers can tell a quiet sub apart from a host failure. Delegates to
+    fetch_feed, so it inherits the dual-host 403 failover, the per-IP request
+    throttle, x-ratelimit pacing, and 429 backoff. The query is truncated to
+    QUERY_MAX_LEN at a word boundary, then URL-encoded. `t` is sent only with
+    sort in (top, relevance); Reddit ignores it for sort=new (filter by
+    created_utc client-side instead).
+
+    Keyless by design: the URL host is always an RSS host, never an auth host.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    if len(q) > QUERY_MAX_LEN:
+        q = q[:QUERY_MAX_LEN].rsplit(" ", 1)[0]
+    if sort not in _SEARCH_SORTS:
+        sort = "new"
+
+    params = [f"q={urllib.parse.quote(q)}", f"sort={sort}", f"limit={int(limit)}"]
+    if t and t in _SEARCH_TIMEFRAMES and sort in ("top", "relevance"):
+        params.append(f"t={t}")
+
+    if sub and restrict_sr:
+        encoded_sub = urllib.parse.quote(_normalize_sub(sub), safe="")
+        params.insert(0, "restrict_sr=1")
+        path = f"/r/{encoded_sub}/search.rss?" + "&".join(params)
+    else:
+        params.insert(0, "restrict_sr=off")
+        path = "/search.rss?" + "&".join(params)
+
+    return fetch_feed(f"https://{RSS_HOSTS[0]}{path}", timeout=timeout)
+
+
 def fetch_subreddit_new(sub: str, limit: int = 25,
                         timeout: int = 15) -> list[dict[str, Any]]:
     """Fetch /r/<sub>/new/.rss and return normalized posts (newest-first).
@@ -607,7 +677,7 @@ def fetch_subreddit_new(sub: str, limit: int = 25,
     The Atom feed is a single page of the most recent ~25 items with no cursor,
     so there is no pagination contract. Returns [] on any fetch/parse failure.
     """
-    encoded = urllib.parse.quote(sub.lstrip("r/").strip())
+    encoded = urllib.parse.quote(_normalize_sub(sub), safe="")
     path = f"/r/{encoded}/new/.rss?limit={int(limit)}"
 
     root = fetch_xml_resilient(path, timeout=timeout)

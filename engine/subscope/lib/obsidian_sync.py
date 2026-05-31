@@ -32,20 +32,17 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
-import time
-from collections import Counter
-from typing import Any
 
 
 def _week_iso(now: dt.datetime | None = None) -> tuple[int, int]:
-    n = now or dt.datetime.utcnow()
+    n = now or dt.datetime.now(dt.timezone.utc)
     return n.isocalendar()[:2]  # (year, week_number)
 
 
 def build_weekly_digest(conn: sqlite3.Connection, now: dt.datetime | None = None) -> str:
     """Return a complete markdown digest as a string. Caller writes it to
     Obsidian via the MCP. Never writes to filesystem itself."""
-    now = now or dt.datetime.utcnow()
+    now = now or dt.datetime.now(dt.timezone.utc)
     year, week = _week_iso(now)
     today_str = now.strftime("%Y-%m-%d")
     week_start = int((now - dt.timedelta(days=7)).timestamp())
@@ -115,6 +112,6 @@ def build_weekly_digest(conn: sqlite3.Connection, now: dt.datetime | None = None
 
 def suggested_filename(now: dt.datetime | None = None) -> str:
     """Standard filename for the weekly digest: `YYYY-WNN-pulse.md`."""
-    n = now or dt.datetime.utcnow()
+    n = now or dt.datetime.now(dt.timezone.utc)
     year, week = _week_iso(n)
     return f"{year}-W{week:02d}-pulse.md"

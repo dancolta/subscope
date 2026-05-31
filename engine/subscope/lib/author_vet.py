@@ -18,7 +18,7 @@ import sqlite3
 import time
 from typing import Any
 
-from . import reddit, store
+from . import reddit
 
 
 # Subs that signal "wrong audience" — hustle-bros, beginners, not real operators.

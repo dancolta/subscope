@@ -442,20 +442,30 @@ print(json.dumps(result))
 
 The output is informational only (showing which providers fired and what was cached). Do not surface it to the user unless both calls were attempted and both reported a fail-open `skipped_reason`, in which case mention once: "DataForSEO and Firecrawl could not reach their APIs. Cache will fill on the next successful onboarding."
 
-Run the first scan:
+Run the first scan (judge-first, same path as /subscope-run):
 
 ```bash
-cd "$CLAUDE_PLUGIN_ROOT" && PYTHONPATH=engine python3 -m subscope.cli fetch-score
+cd "$CLAUDE_PLUGIN_ROOT" && PYTHONPATH=engine python3 -m subscope.cli fetch-score --candidates
 ```
 
 Branch on the engine's `status` field before rendering:
 
-- `status: "ok"` with surfaces: render the engine's `inline_table` in chat. If destinations include Notion/Slack/Obsidian, the engine handles those automatically.
-- `status: "ok"` with zero surfaces: a quiet first scan is normal, the targeting is still saved. Print verbatim:
+- `status: "ok"` with judged surfaces: judge the `candidates[]` per `skills/run/SKILL.md` Step 3.5 and render the output as the two-table layout in `run` Step 4 (a BUYER SIGNALS table, then an AUTHORITY PLAYS table, each with hyperlinked subreddit, hyperlinked thread, a short why, and age), not the raw `inline_table`. If destinations include Notion/Slack/Obsidian, the engine handles those automatically.
+- `status: "ok"` with zero judged surfaces (the first scan read each sub's newest posts and nothing crossed the bar, or you judged every candidate REJECT): the targeting IS saved. A quiet first scan is normal for a focused niche, where switching threads are weekly, not daily. Do NOT auto-run anything else. Print verbatim, then WAIT for a yes/no reply:
 
   ```
-  No qualifying posts on this first scan. Your targeting is saved. Reddit was reachable, there just was not a buyer-intent thread in your subs right now. Run /subscope-run again later, fresh posts land through the day.
+  Your targeting is saved. This first scan read each sub's newest posts and nothing crossed the bar right now, which is normal for a focused niche.
+
+  Want me to run a wider one-time scan? It searches the last 7 days across your subs instead of only the newest posts, so it usually finds something to prove the setup works. Reply "yes" to run it, or "no" to stop here and run /subscope-run later.
   ```
+
+  If the user replies yes (or any clear affirmative), run the comprehensive 7-day scan below, judge its candidates with the SAME Step 3.5 judge, and render them as the two-table layout from `run` Step 4. This widens recall from "newest posts only" to "last 7 days via Reddit search", which is what proves the setup on a quiet niche:
+
+  ```bash
+  cd "$CLAUDE_PLUGIN_ROOT" && PYTHONPATH=engine python3 -m subscope.cli fetch-score --candidates --search --since-days 7 --window week --max-surfaces 12
+  ```
+
+  If this wider scan ALSO yields zero judged surfaces, print the empty-state ladder from `skills/run/SKILL.md` "After completion" (closest near-misses + `/subscope-profile` to widen the sub list). Never dead-end. If the user replies no, skip to the closing card below.
 
 - `status: "rate_limited"`: the configs were written fine, Reddit just rate-limited this first scan (HTTP 429). Render any surfaces you got, then print verbatim:
 

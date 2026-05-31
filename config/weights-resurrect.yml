@@ -1,0 +1,81 @@
+# Pattern override: resurrect. Shadows weights.yml for `fetch-score --mode resurrect`.
+#
+# IMPORTANT: _load_configs merges top-level keys SHALLOWLY
+# (weights = {**base, **mode_override}), so every block present here REPLACES the
+# base block entirely. Each block below is therefore the FULL base block with only
+# the resurrect deltas applied. Do not trim a block to "just the changed key" or
+# the merge will drop the rest of that block's settings.
+
+# Age gates must never reject an old thread before the client-side age band runs.
+# The real 6-18 month window lives in cli.SEARCH_STRATEGY["resurrect"]; these gate
+# ceilings just have to stay out of its way.
+tier1_gates:
+  post_age_hours: 1000000          # effectively no upper age gate (band handles it)
+  comment_ceiling: 0               # 0 disables the ceiling (RSS carries no counts anyway)
+  pain_keywords_min: 1
+tier2_gates:
+  post_age_hours: 1000000
+  pain_keywords_min: 1
+  pain_keywords_min_wide_open: 1
+
+# Freshness rewritten: a 6-18 month thread must still score. zero_hours pushed past
+# 18 months so freshness contributes a small positive instead of 0, and its weight
+# is dialed down (freshness is not the point of an evergreen thread). Full block
+# copied from base so the shallow merge keeps the other signal configs intact.
+scoring:
+  freshness_decay:
+    zero_hours: 13200              # ~18.1 months; resurrect posts keep nonzero freshness
+    max_points: 10                 # de-emphasized vs default 30
+  upvote_velocity:
+    multiplier: 4
+    max_points: 20
+  comment_velocity:
+    multiplier: 6
+    max_points: 15
+  pain_keyword_match:
+    points_per_keyword: 6
+    max_points: 30
+  blog_coverage_bonus:
+    points_per_match: 25
+    max_points: 50
+  intent_bonus:
+    question_bonus: 20
+    pain_bonus: 15
+  tier_weight:
+    tier_1: 1.0
+    tier_2: 1.25
+
+# Evergreen, no urgency: keep the 30-minute resurrect hold.
+cooling:
+  default_minutes: 30
+  pricing_rage_minutes: 0
+  resurrect_minutes: 30
+
+# Freshness floor OFF: it auto-promotes posts younger than 24h, which can never
+# match a 6-18 month thread and would otherwise pull in nothing useful.
+freshness_floor:
+  enabled: false
+
+# Small cap (evergreen, slow compounding). Never backfill /new noise into resurrect.
+daily_output:
+  hard_ceiling: 12
+  default_target: 3
+  minimum: 0
+  tier1_per_sub_cap: 2
+  tier2_per_sub_cap: 2
+  backfill_sub_cap_bonus: 0
+  pattern_caps:
+    resurrect: 3
+
+# Author quality thresholds preserved from base (the shallow merge would otherwise
+# drop them, falling back to author_vet.py module defaults, which are the same
+# values; carried here explicitly so behavior is identical and visible).
+author_vet:
+  min_comment_karma: 50
+  min_account_age_days: 30
+  max_wrong_audience_fraction: 0.80
+
+# Authority second pass OFF for resurrect: resurrect is its own intent. Avoid a
+# brandless authority pass pulling /new-era questions into an evergreen surface.
+authority_track:
+  enabled: false
