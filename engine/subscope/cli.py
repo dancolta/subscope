@@ -75,6 +75,25 @@ PATTERN_EMOJI = {
     "rivals": "🥷",
 }
 
+# Per-mode fetch strategy. `default` maps to None, which keeps the historical
+# fetch_delta(/new) path byte-for-byte. Every other mode fetches via the keyless
+# search.rss path (reddit.fetch_search) with a per-mode sort + timeframe and an
+# optional client-side age band (age_min_h..age_max_h, in hours; age_max_h None
+# means no upper bound). sort=new ignores t= (Reddit only honors t= for
+# sort=top/relevance), so those modes window by created_utc client-side. The
+# ~408h (17d) ceiling is the live-measured depth of a restrict_sr search on
+# sort=new; resurrect uses sort=top + a 6-18 month band.
+SEARCH_STRATEGY: dict[str, dict[str, Any] | None] = {
+    "default":      None,
+    "stack-audit":  {"sort": "new", "t": None,   "limit": 25, "age_min_h": 0,    "age_max_h": 408},
+    "churn":        {"sort": "new", "t": None,   "limit": 25, "age_min_h": 0,    "age_max_h": 408},
+    "build-vs-buy": {"sort": "new", "t": None,   "limit": 25, "age_min_h": 0,    "age_max_h": 408},
+    "rfp-bait":     {"sort": "new", "t": None,   "limit": 25, "age_min_h": 0,    "age_max_h": 408},
+    "rivals":       {"sort": "new", "t": None,   "limit": 25, "age_min_h": 0,    "age_max_h": 168},
+    "pricing-rage": {"sort": "new", "t": None,   "limit": 25, "age_min_h": 0,    "age_max_h": 168},
+    "resurrect":    {"sort": "top", "t": "year", "limit": 25, "age_min_h": 4320, "age_max_h": 13140},
+}
+
 
 def _load_configs(mode: str = "default") -> dict[str, Any]:
     """Load subs + mode-specific keywords + mode-specific weight overrides.
@@ -118,6 +137,111 @@ def _load_configs(mode: str = "default") -> dict[str, Any]:
 
 def _bucket_keywords(bucket: str, kw: dict[str, Any]) -> list[str]:
     return list(set(kw.get("shared", []) + kw.get(bucket, [])))
+
+
+def _build_mode_query(mode: str, bucket_kw: list[str], brands: list[str]) -> str:
+    """Build a within-sub search query for a pattern mode.
+
+    OR-joins a bounded, deterministic set of the mode's keyword bucket (multi-word
+    terms quoted as phrases) plus up to two brand anchors for co-occurrence. The
+    `rivals` mode leads with brand names (its whole job is competitor mentions);
+    other modes lead with category keywords. Sorted for run-to-run reproducibility
+    (the keyword bucket comes from a set()). Bounded so the URL-quoted query stays
+    under reddit.QUERY_MAX_LEN (fetch_search truncates again as a backstop).
+    """
+    def _q(term: str) -> str:
+        term = (term or "").strip()
+        if not term:
+            return ""
+        return f'"{term}"' if " " in term else term
+
+    if mode == "rivals" and brands:
+        raw = [_q(b) for b in brands[:6]]
+    else:
+        raw = [_q(k) for k in sorted(bucket_kw)[:18]]
+        raw += [_q(b) for b in brands[:2]] if brands else []
+
+    seen: set[str] = set()
+    terms: list[str] = []
+    for term in raw:
+        low = term.lower()
+        if term and low not in seen:
+            seen.add(low)
+            terms.append(term)
+
+    q = " OR ".join(terms)
+    if len(q) > reddit.QUERY_MAX_LEN:
+        q = q[:reddit.QUERY_MAX_LEN].rsplit(" ", 1)[0]
+    return q
+
+
+def _fetch_mode_search(
+    sub: dict[str, Any], mode: str, strat: dict[str, Any],
+    keywords: dict[str, Any], brands: list[str], limit_per_sub: int,
+) -> list[dict[str, Any]]:
+    """Fetch candidate posts for a search-based mode via reddit.fetch_search.
+
+    Within-sub search (restrict_sr) using the mode's sort/timeframe, then a
+    client-side age band so each mode keeps its intended window (resurrect 6-18mo,
+    pricing-rage/rivals 7d, others ~17d). Falls back to /new for non-resurrect
+    modes only when the search feed is UNREACHABLE (None); resurrect never falls
+    back, since a ~3.5-day /new window cannot contain a 6-18 month thread. Skips
+    removed/locked, returns newest-first, capped at limit_per_sub.
+    """
+    bucket_kw = _bucket_keywords(sub["bucket"], keywords)
+    q = _build_mode_query(mode, bucket_kw, brands)
+    cap = min(limit_per_sub, int(strat.get("limit", 25)))
+    age_min_h = float(strat.get("age_min_h", 0) or 0)
+    age_max_h = strat.get("age_max_h")
+
+    def _band(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for p in posts:
+            if p.get("removed") or p.get("locked"):
+                continue
+            ah = score.age_hours(p)
+            if ah < age_min_h:
+                continue
+            if age_max_h is not None and ah > float(age_max_h):
+                continue
+            out.append(p)
+            if len(out) >= limit_per_sub:
+                break
+        return out
+
+    # A query-less search is meaningless (misconfigured profile). Non-resurrect
+    # modes fall back to /new with a fresh window; resurrect contributes nothing.
+    if not q:
+        return [] if mode == "resurrect" else reddit.fetch_delta(
+            sub["name"], None, max_limit=limit_per_sub)
+
+    posts = reddit.fetch_search(
+        sub["name"], q, sort=strat["sort"], t=strat.get("t"),
+        limit=cap, restrict_sr=True,
+    )
+    if posts is None:
+        # Unreachable. Pass None cursor so the /new fallback is not watermark-starved.
+        return [] if mode == "resurrect" else reddit.fetch_delta(
+            sub["name"], None, max_limit=limit_per_sub)
+
+    if mode == "resurrect":
+        banded = _band(posts)
+        # Widen to all-time top for the 12-18 month tail only when the year page
+        # came back FULL (cap posts) yet light on in-band hits, i.e. the page was
+        # dominated by sub-6-month posts and older threads likely exist. A thin
+        # year page (sub just has little history) is not worth a second GET on
+        # every sub: this is the rate-limit guard, search shares the per-IP bucket.
+        if len(banded) < cap and len(posts) >= cap:
+            more = reddit.fetch_search(
+                sub["name"], q, sort="top", t="all", limit=cap, restrict_sr=True)
+            if more:
+                by_id = {p["id"]: p for p in posts}
+                for p in more:
+                    by_id.setdefault(p["id"], p)
+                banded = _band(list(by_id.values()))
+        return banded
+
+    return _band(posts)
 
 
 def cmd_setup() -> None:
@@ -203,6 +327,9 @@ def cmd_fetch_score(
     no_enrich: bool = False,                # kill switch for DFS + Firecrawl cache reads
     explain: bool = False,                  # diagnostic: emit per-post gate inputs + drop reason
     candidates: bool = False,               # judge-first: emit a candidates list for the skill judge
+    search: bool = False,                   # force the search.rss fetch path even for default mode
+    since_days: int | None = None,          # override active mode age window to the last N days
+    window: str | None = None,              # override search recency: new|week|month|year|all
 ) -> None:
     """Run the surface pipeline for a specific pattern mode.
 
@@ -301,15 +428,46 @@ def cmd_fetch_score(
             assert db_sub is not None
 
             last_cursor = db_sub.get("last_cursor")
+            # Resolve the fetch strategy. default -> None -> historical /new delta
+            # path, unchanged. --search forces a neutral search path onto default
+            # mode (onboarding recovery + power users). --since-days / --window
+            # then refine whatever strategy is active.
+            strat = SEARCH_STRATEGY.get(mode)
+            if strat is None and search:
+                strat = {"sort": "new", "t": None, "limit": limit_per_sub,
+                         "age_min_h": 0, "age_max_h": 408}
+            if strat is not None:
+                if since_days is not None:
+                    strat = {**strat, "age_max_h": max(1, int(since_days)) * 24}
+                    # A recency override (e.g. --since-days 7) on an old-threads mode
+                    # like resurrect (age_min_h 4320) would make min > max and band
+                    # out everything. Honor the user's recency intent: drop the floor.
+                    if strat.get("age_min_h", 0) > strat["age_max_h"]:
+                        strat = {**strat, "age_min_h": 0}
+                if window is not None:
+                    strat = ({**strat, "sort": "new", "t": None} if window == "new"
+                             else {**strat, "sort": "top", "t": window})
+                    # A recency-window override means "give me posts from this
+                    # window", so drop a mode's old-threads floor (resurrect's
+                    # 6-month age_min) that would otherwise band them all out.
+                    strat = {**strat, "age_min_h": 0}
             try:
-                # RSS/Atom fetcher (keyless). See reddit.fetch_delta() docstring.
-                posts = reddit.fetch_delta(s["name"], last_cursor, max_limit=limit_per_sub)
+                if strat is None:
+                    # default mode: UNCHANGED /new delta path (byte-for-byte).
+                    posts = reddit.fetch_delta(s["name"], last_cursor, max_limit=limit_per_sub)
+                else:
+                    posts = _fetch_mode_search(
+                        s, mode, strat, cfg["keywords"], brands, limit_per_sub)
             except Exception as e:
                 fetch_errors.append(f"r/{s['name']}: {e}")
                 continue
 
             total_fetched += len(posts)
-            if posts:
+            # Only the default /new path advances the last_cursor watermark. Search
+            # modes rely on the surfaced-PK dedup, not the cursor; advancing it from
+            # a search result (which is not the newest /new post) would corrupt the
+            # next default run's delta window.
+            if strat is None and posts:
                 store.update_cursor(conn, s["name"], posts[0]["id"])
 
             bucket_kw = _bucket_keywords(s["bucket"], cfg["keywords"])
@@ -359,11 +517,15 @@ def cmd_fetch_score(
                     _intent = score.has_question_intent(_t, _b) or score.has_pain_markers(_t, _b)
                     _brand = score.names_relevant_brand(_t, _b, brands)
                     _age = score.age_hours(post)
+                    # Freshness tiebreak is meaningless for resurrect (every post
+                    # is months old by design), so zero it there rather than let it
+                    # uniformly bury the whole mode's recall ordering.
+                    _fresh = 0.0 if mode == "resurrect" else max(0.0, (48.0 - _age) / 48.0)
                     _rank = (
                         (2.0 if _intent else 0.0)
                         + (3.0 if _brand else 0.0)
                         + float(_n)
-                        + max(0.0, (48.0 - _age) / 48.0)  # freshness 0..1
+                        + _fresh  # freshness 0..1
                     )
                     cand_list.append({
                         "id": post["id"],
@@ -889,6 +1051,14 @@ def main(argv: list[str] | None = None) -> None:
                          "Reddit API is fine with the volume; review fatigue is the actual risk. "
                          "Plan ~1 min per surface. To raise the per-profile sub ceiling above 13 "
                          "total, edit tier1_subs_max / tier2_subs_max in weights.yml.")
+    fs.add_argument("--search", action="store_true",
+                    help="Force the keyless search.rss fetch path even for default mode (used by "
+                         "the onboarding 7-day recovery scan and power users). Pattern modes already search.")
+    fs.add_argument("--since-days", type=int, default=None,
+                    help="Override the active mode's client-side age window to the last N days.")
+    fs.add_argument("--window", choices=["new", "week", "month", "year", "all"], default=None,
+                    help="Override search recency. 'new' = newest first; week/month/year/all = "
+                         "sort=top with that Reddit timeframe.")
 
     ov = sub.add_parser("op-vet", help="Score a Reddit OP profile (utility, one-shot)")
     ov.add_argument("username", type=str)
@@ -933,6 +1103,9 @@ def main(argv: list[str] | None = None) -> None:
             no_enrich=args.no_enrich,
             explain=args.explain,
             candidates=args.candidates,
+            search=args.search,
+            since_days=args.since_days,
+            window=args.window,
         )
     elif args.cmd == "op-vet":
         cmd_op_vet(args.username)

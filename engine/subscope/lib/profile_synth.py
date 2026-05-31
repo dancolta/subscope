@@ -1,33 +1,29 @@
-"""Profile synthesis: turn 8 interview answers into a personalized subscope config.
+"""Profile synthesis: turn interview answers into a personalized subscope config.
 
-Used by `/subscope-profile`. Three modes:
+Used by `/subscope-profile` and `/subscope-onboard`. Two modes:
 
-  1. LLM synthesis (Anthropic API key path) — full personalized config
-  2. Archetype-mapped synthesis (subscription / no-key path) — Claude-in-chat
-     reasons over the same prompt, falls back to archetype_map.best_match()
-     if synthesis fails
-  3. Pure archetype fallback (no LLM available) — interview answers used only
-     to pick the closest of 6 pre-baked archetypes
+  1. Archetype-mapped synthesis (the default path): Claude reasons over the
+     interview answers in chat and layers the user's competitors, pain language,
+     and homepage findings on top of an archetype seed. The in-session reasoning
+     IS the synthesis.
+  2. Pure archetype fallback (no LLM reasoning available): the interview answers
+     are used only to pick the closest of 6 pre-baked archetypes.
 
 Output: 4 YAML files written under XDG config dir:
   - subreddits.yml     (tier 1/2/3 with reasoning per sub)
   - keywords.yml       (shared/operator/builder buckets)
   - brand-anchor.yml   (competitor list)
-  - example-pains.yml  (5 made-up titles for LLM classifier few-shots)
+  - example-pains.yml  (5 example pain titles for the optional LLM classifier)
 
 Plus a validation pass that enforces caps from weights.yml config_ceilings.
 """
 from __future__ import annotations
 
 import json
-import os
-import re
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from . import archetype_map, classify, store
+from . import archetype_map, store
 
 
 # ─── JSON schema for LLM output (validated before YAML emit) ──────────
@@ -281,55 +277,6 @@ def write_to_xdg(yaml_files: dict[str, str], backup: bool = True) -> dict[str, P
         path.chmod(0o600)
         written[filename] = path
     return written
-
-
-def llm_synthesize(interview_summary: str, model: str | None = None) -> dict[str, Any] | None:
-    """Bulk-LLM path: call any OpenAI-compatible provider with the synthesis prompt.
-
-    Routes through the same provider-agnostic OpenAI SDK path that classify.py
-    uses — so user config in ~/.config/subscope/llm.json + the LLM_API_KEY env
-    var both work transparently. Returns the parsed JSON payload, or None if
-    no LLM is configured (caller falls back to archetype path).
-    """
-    if classify.detect_provider() == "disabled":
-        return None
-    try:
-        import openai  # type: ignore
-    except ImportError:
-        return None
-
-    api_key, base_url, resolved_model = classify._resolve_llm_endpoint()
-    if not api_key:
-        return None
-    model = model or resolved_model
-    prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "profile_synth.md"
-    system_prompt = prompt_path.read_text()
-    client = openai.OpenAI(api_key=api_key, base_url=base_url)
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=4000,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": interview_summary},
-            ],
-        )
-    except Exception:
-        return None
-    text = (resp.choices[0].message.content or "").strip()
-    # Strip code fence if present
-    if text.startswith("```"):
-        text = re.sub(r"^```\w*\n", "", text)
-        text = text.rstrip("`").rstrip()
-    try:
-        # The prompt may emit both JSON and YAML blocks; pick the first JSON object
-        first_brace = text.find("{")
-        last_brace = text.rfind("}")
-        if first_brace < 0 or last_brace < 0:
-            return None
-        return json.loads(text[first_brace : last_brace + 1])
-    except json.JSONDecodeError:
-        return None
 
 
 def fallback_from_archetype(interview_answers: dict[str, str]) -> dict[str, Any]:

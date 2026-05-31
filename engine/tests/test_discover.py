@@ -18,12 +18,23 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from subscope.lib import discover, enrich, reddit, store  # noqa: E402
 
 
 NOW = int(time.time())
+
+
+@pytest.fixture(autouse=True)
+def _stub_subreddit_directory(monkeypatch):
+    """search_subreddits() hits reddit.fetch_xml_resilient, a network seam the
+    per-test fetch_feed mocks do not cover. Default it to no-op so the existing
+    discovery tests stay hermetic (directory recall returns nothing unless a
+    test explicitly patches it)."""
+    monkeypatch.setattr(reddit, "fetch_xml_resilient", lambda *a, **k: None)
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────
@@ -1081,6 +1092,126 @@ def test_evidence_has_absolute_timestamp():
     assert result["recent_thread_iso"] is not None
     assert "UTC" in result["recent_thread_iso"]
     assert result["recent_thread_created_utc"] is not None
+
+
+# ─── Subreddit-directory search (the discovery recall fix) ─────────────
+
+
+def _sr_feed(*subs):
+    """Build a /subreddits/search.rss Atom root, one <entry> per subreddit."""
+    import xml.etree.ElementTree as ET
+    ns = "http://www.w3.org/2005/Atom"
+    feed = ET.Element(f"{{{ns}}}feed")
+    for name in subs:
+        e = ET.SubElement(feed, f"{{{ns}}}entry")
+        ET.SubElement(e, f"{{{ns}}}title").text = name
+        ET.SubElement(e, f"{{{ns}}}link").set("href", f"https://www.reddit.com/r/{name}/")
+    return feed
+
+
+def test_search_subreddits_extracts_sub_from_link():
+    root = _sr_feed("projectmanagement", "agency", "consulting")
+    with patch.object(reddit, "fetch_xml_resilient", return_value=root):
+        hits = discover.search_subreddits("project management", sleep_between=0)
+    assert [h["sub"] for h in hits] == ["projectmanagement", "agency", "consulting"]
+    assert hits[0]["source"] == "subreddit_search"
+    assert hits[0]["rank_pos"] == 0
+
+
+def test_search_subreddits_unreachable_returns_empty():
+    with patch.object(reddit, "fetch_xml_resilient", return_value=None):
+        assert discover.search_subreddits("x", sleep_between=0) == []
+
+
+def test_derive_sub_queries_prioritizes_competitors_industry_offering():
+    answers = {
+        "what_offering": "project management for agencies and services firms",
+        "who_to_reach": "ops managers and delivery leads at agencies and consulting firms",
+        "pain_quote": "x",
+    }
+    q = discover.derive_sub_queries(answers, ["Asana", "Monday.com"], None)
+    assert "asana" in q and "monday" in q           # competitor communities
+    assert "agencies" in q and "consulting" in q     # industry nouns (after "at")
+    assert "leads" not in q and "managers" not in q  # role words excluded
+
+
+def test_rank_subs_directory_surfaces_community_with_no_threads():
+    vocab = {"project", "management", "agency"}
+    hits = [{"sub": "projectmanagement", "display_title": "Project Management",
+             "rank_pos": 0, "source_query": "project management",
+             "source": "subreddit_search"}]
+    ranked = discover.rank_subs([], user_vocab=vocab, directory_hits=hits)
+    top = next((r for r in ranked if r["name"] == "projectmanagement"), None)
+    assert top is not None                 # surfaced despite zero threads
+    assert top["directory_match"] is True
+    assert top["vocab_match"] is True
+
+
+def test_rank_subs_directory_drops_offtopic_noise():
+    # No vocab/competitor signal -> dropped (skill review never even sees it).
+    hits = [{"sub": "labrador", "display_title": "The bestest dogs", "rank_pos": 3,
+             "source_query": "professional services", "source": "subreddit_search"}]
+    ranked = discover.rank_subs([], user_vocab={"project", "management"}, directory_hits=hits)
+    assert all(r["name"] != "labrador" for r in ranked)
+
+
+def test_rank_subs_directory_marks_competitor_community():
+    hits = [{"sub": "Asana", "display_title": "Asana", "rank_pos": 0,
+             "source_query": "asana", "source": "subreddit_search"}]
+    ranked = discover.rank_subs([], user_vocab=set(), comp_tokens={"asana"},
+                                directory_hits=hits)
+    top = next((r for r in ranked if r["name"].lower() == "asana"), None)
+    assert top is not None and top["competitor_match"] is True
+
+
+def test_rank_subs_directory_boosts_existing_thread_sub():
+    # A sub found via BOTH threads and the directory gets the directory_match flag
+    # and both sources (cross-source confirmation).
+    threads = [
+        {"sub": "projectmanagement", "score": 5, "num_comments": 1,
+         "created_utc": NOW - 86400, "source_query": "q1", "source": "reddit_native"},
+        {"sub": "projectmanagement", "score": 5, "num_comments": 1,
+         "created_utc": NOW - 86400, "source_query": "q2", "source": "reddit_native"},
+    ]
+    hits = [{"sub": "projectmanagement", "display_title": "Project Management",
+             "rank_pos": 0, "source_query": "project management",
+             "source": "subreddit_search"}]
+    ranked = discover.rank_subs(threads, user_vocab={"project", "management"},
+                                directory_hits=hits)
+    pm = next((r for r in ranked if r["name"] == "projectmanagement"), None)
+    assert pm is not None and pm["directory_match"] is True
+    assert "subreddit_search" in pm["sources"] and "reddit_native" in pm["sources"]
+
+
+def test_comp_hit_dotted_brand_matches_community_not_weekday():
+    # Monday.com: the dotcom community should match; the bare weekday sub must not.
+    hits = [
+        {"sub": "mondaydotcom", "display_title": "monday.com", "rank_pos": 0,
+         "source_query": "monday", "source": "subreddit_search"},
+        {"sub": "monday", "display_title": "Monday", "rank_pos": 1,
+         "source_query": "monday", "source": "subreddit_search"},
+    ]
+    ranked = discover.rank_subs([], user_vocab=set(), comp_tokens={"monday.com"},
+                                directory_hits=hits)
+    by = {r["name"].lower(): r for r in ranked}
+    assert "mondaydotcom" in by and by["mondaydotcom"]["competitor_match"] is True
+    assert "monday" not in by  # weekday sub: no comp_hit, no vocab -> dropped
+
+
+def test_comp_hit_no_overmatch_on_short_token():
+    # A 2-char brand must not suffix-match an unrelated sub (r/gousers).
+    hits = [{"sub": "gousers", "display_title": "Go Users", "rank_pos": 0,
+             "source_query": "go", "source": "subreddit_search"}]
+    ranked = discover.rank_subs([], user_vocab=set(), comp_tokens={"go"},
+                                directory_hits=hits)
+    assert all(r["name"] != "gousers" for r in ranked)
+
+
+def test_audience_industry_nouns_skips_prepositions():
+    nouns = discover._audience_industry_nouns(
+        "ops leads at agencies and consulting firms serving healthcare")
+    assert "agencies" in nouns and "consulting" in nouns
+    assert "serving" not in nouns
 
 
 if __name__ == "__main__":

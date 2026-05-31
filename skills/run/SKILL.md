@@ -93,7 +93,7 @@ From those, hold a one-paragraph offer model in mind: WHAT they sell, WHO buys i
 - Every BUYER and AUTHORITY surface MUST carry a one-line reason naming the offer-pain or signal it matched. No defensible reason means do not surface it.
 - Precision over volume. Surfacing 2 right posts beats surfacing 8 with 3 wrong ones. There is no minimum.
 - Cap total surfaces at the daily cap (`weights.yml` `daily_output`, default ~10). Rank BUYER above AUTHORITY, then by strength of buying intent.
-- Use each candidate's `url` verbatim. NEVER hand-compose a Reddit URL.
+- Every surfaced thread MUST be rendered as a clickable link to its Reddit thread, using the candidate's `url` verbatim (read it from the JSON; NEVER hand-compose a Reddit URL). A surfaced row without its clickable link is a defect.
 
 This judge is the same decision the optional `classify.py` path makes headlessly when a user supplies an LLM key; here you are the judge because the Claude session is the LLM.
 
@@ -109,7 +109,22 @@ default_render: table     # which surface /subscope-run prints first in chat
 Rendering rules:
 
 - If `surface.yml` is missing → default to `modes: [table]`.
-- If `modes` contains `table` → print the **judge output from Step 3.5** as two sections: `BUYER SIGNALS` first, then `AUTHORITY PLAYS`. Each row: the post title linked via the candidate `url` (verbatim), `r/sub`, and the one-line reason. Omit a section if it has no surfaces. This judged output, not the engine's `inline_table`, is the chat surface under judge-first. (`inline_table` remains in the JSON as the lexical-gate fallback.)
+- If `modes` contains `table` → render the judged output as **two separate markdown tables**, the `BUYER SIGNALS` table first, then the `AUTHORITY PLAYS` table. Each table uses exactly these columns:
+
+  ```
+  ### BUYER SIGNALS
+  | Subreddit | Thread | Why it matters | Age |
+  |---|---|---|---|
+  | [r/<sub>](https://www.reddit.com/r/<sub>) | [<post title>](<url>) | <one-line reason> | <age> |
+  ```
+
+  Cell rules:
+  - **Subreddit**: a clickable link `[r/<sub>](https://www.reddit.com/r/<sub>)`; the subreddit name is the link text.
+  - **Thread**: the post title as a clickable link using the candidate `url` **verbatim** from the JSON. NEVER hand-compose a Reddit URL (one wrong character can resolve to an unrelated, possibly NSFW post). Trim a very long title to ~70 chars but keep the link intact, and escape any `|` in the title as `\|`.
+  - **Why it matters**: one short phrase on why this post fits the offer (the judge reason). A phrase, not a sentence.
+  - **Age**: from the candidate `age_h`, hours when under 24h (e.g. `14h`), else days (e.g. `6d`).
+
+  Omit a table entirely when its track has no surfaces. This two-table layout, not the engine's `inline_table`, is the chat surface under judge-first. (`inline_table` remains in the JSON as the lexical-gate fallback.)
 - If `modes` contains `notion` → do the Notion sync above. If the user picked BOTH `table` and `notion`, render the table in chat AND sync to Notion.
 - If `modes` is empty `[]` → don't print anything beyond JSON (for piping).
 
