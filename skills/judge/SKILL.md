@@ -27,24 +27,21 @@ Three paths the user might take:
 
 **A. Surface number from today's list.** The most recent `inline_markdown` from `/subscope-run` is in your conversation context. Find the surface in the numbered list by index. Extract: post URL, title, body, subreddit.
 
-**B. Reddit URL pasted.** Read the post via the engine's public-JSON fetcher:
+**B. Reddit URL pasted.** Read the post via the engine's keyless RSS fetcher. Pass the URL through an environment variable (never interpolate it into the Python source, so a quote or special char in the URL cannot break the command):
 
 ```bash
-cd "$CLAUDE_PLUGIN_ROOT" && PYTHONPATH=engine python3 -c "
-import sys
+cd "$CLAUDE_PLUGIN_ROOT" && PYTHONPATH=engine REDDIT_URL="$REDDIT_URL" python3 -c "
+import os, sys, json
 from subscope.lib import reddit
-# Extract post ID from URL
-url = '$REDDIT_URL'
-import re
-m = re.search(r'/comments/([a-z0-9]+)', url)
-if not m: print('Bad URL'); sys.exit(1)
-pid = m.group(1)
-data = reddit.fetch_json(f'https://www.reddit.com/comments/{pid}.json')
-post = data[0]['data']['children'][0]['data']
-import json
-print(json.dumps({'subreddit': post.get('subreddit'), 'title': post.get('title'), 'body': (post.get('selftext') or '')[:800]}))
+post = reddit.fetch_post(os.environ['REDDIT_URL'])
+if not post:
+    print('Could not reach that post. Check the URL, or paste the title and body directly and I will judge from that.', file=sys.stderr)
+    sys.exit(1)
+print(json.dumps({'subreddit': post['subreddit'], 'title': post['title'], 'body': (post['body'] or '')[:800]}))
 "
 ```
+
+`fetch_post` handles id extraction, validation, and the dual-host RSS failover internally. If it returns nothing (post removed, deleted, or Reddit unreachable), fall back to Path C: ask the user to paste the title and body.
 
 **C. Free-text paste.** User pastes a title + body directly. No fetch needed — just structure it.
 

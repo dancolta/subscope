@@ -2,6 +2,7 @@
 
 Public surface (what callers use):
   - fetch_delta(sub, last_seen_id, max_limit)   : daily-delta scan
+  - fetch_post(url_or_id)                       : single submission via /comments/<id>/.rss
   - fetch_user_about(username)                  : OP profile vetting (now None)
   - fetch_user_recent_subs(username, limit)     : OP audience-fit histogram
   - canonical_url(post_data)                    : URL normalization
@@ -239,9 +240,11 @@ def canonical_url(reddit_post_data: dict[str, Any]) -> str:
 def fetch_json(url: str, timeout: int = 15) -> dict[str, Any] | None:
     """Fetch JSON with retry on 429 and content-type validation.
 
-    Reddit's anonymous JSON surface 403s as of 2026-05-29, so this is no longer
-    on the live path. Retained for callers/tests that still exercise the JSON
-    parse contract; fetch_xml is the path used by fetch_delta.
+    Reddit's anonymous JSON surface 403s as of 2026-05-29 and there are NO
+    production callers left (the judge skill moved to fetch_post / RSS). Retained
+    ONLY so the parse-contract and path-injection-guard tests
+    (test_unsafe_username_rejected) keep a stable patch target. Do not call from
+    new code; use fetch_post / fetch_xml_resilient.
     """
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     req = urllib.request.Request(url, headers=headers)
@@ -730,6 +733,57 @@ def fetch_delta(sub: str, last_seen_id: str | None,
                 max_limit: int = 50) -> list[dict[str, Any]]:
     """Daily-delta scan: posts newer than last_seen_id from /r/<sub>/new/.rss."""
     return _fetch_delta_public(sub, last_seen_id, max_limit=max_limit)
+
+
+def fetch_post(url_or_id: str, timeout: int = 15) -> dict[str, Any] | None:
+    """Fetch a single Reddit submission by URL or bare id via the keyless
+    comments RSS feed (`/comments/<id>/.rss`).
+
+    Accepts a full Reddit URL (any host variant: www, old, np, m), a comment
+    deep-link (returns the PARENT submission, which is the right thing to judge),
+    or a bare post id ('abc123' or 't3_abc123'). Reddit post ids are base-36
+    lowercase; an uppercase paste is lowercased so it matches the feed.
+
+    Goes through fetch_xml_resilient, inheriting the dual-host 403 failover
+    (www -> old.reddit), the per-IP request throttle, x-ratelimit pacing, 429
+    backoff, and the UA-only header discipline (NO Accept header). One GET per
+    call (two only on a www 403 failover).
+
+    The first <entry> in a comments feed is the submission (id 't3_...');
+    comment entries ('t1_...') are dropped by parse_atom_entry's id guard. We
+    select by id-match rather than position, so a feed that lists a comment
+    before the submission still returns the submission, never a comment.
+
+    Returns the normalized post dict (same shape as parse_atom_entry), or None
+    when: the id cannot be extracted/validated (no network call is made), the
+    feed is unreachable or rate-limited, or the feed carries no submission entry
+    matching the id. Callers cannot distinguish unreachable from removed/empty
+    (both map to None); for the judge skill that is enough (reach, or fall back
+    to a pasted title+body).
+
+    This is the keyless replacement for the dead fetch_json single-post path.
+    """
+    # Extract -> validate -> build URL -> fetch. Order is load-bearing: validate
+    # the EXTRACTED id (not the raw input, which legitimately contains '/' and
+    # ':'), and validate BEFORE interpolating into the path (injection guard).
+    raw = (url_or_id or "").strip()
+    m = re.search(r"/comments/([a-z0-9]+)", raw, re.I)
+    post_id = m.group(1) if m else re.sub(r"^t3_", "", raw)
+    post_id = post_id.lower()
+    if not re.fullmatch(r"[a-z0-9]+", post_id):
+        _log(f"fetch_post: bad id {url_or_id!r}")
+        return None
+
+    root = fetch_xml_resilient(f"/comments/{post_id}/.rss", timeout=timeout)
+    if root is None:
+        return None
+
+    for entry in root.findall(f"{_ATOM_NS}entry"):
+        p = parse_atom_entry(entry)
+        if p and p["id"] == post_id:
+            return p
+    _log(f"fetch_post: no submission entry for {post_id}")
+    return None
 
 
 def fetch_user_about(username: str) -> dict[str, Any] | None:
