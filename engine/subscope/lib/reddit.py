@@ -17,7 +17,15 @@ instant `403 Blocked` (Retry-After: 0) for every unauthenticated `.json`
 endpoint, www and old reddit alike, regardless of User-Agent. The machine IP is
 fine (HTML + RSS both return 200). The RSS/Atom surface
 (`/r/<sub>/new/.rss`, `/user/<x>/comments/.rss`) still returns 200 with no
-credentials, so the fetcher reads those instead. For resilience the fetcher
+credentials, so the fetcher reads those instead.
+
+Header discipline (2026-06-01): RSS GETs send a User-Agent and NOTHING ELSE. The
+edge began 403ing any keyless RSS request that carries an explicit `Accept`
+header from a non-browser TLS client (any value, including `*/*`); the identical
+URL with UA-only returns 200. The trigger is the header's presence, not its
+value, so the fetcher omits Accept entirely. This is a deterministic fingerprint
+block, not a transient: a request with Accept fails on every retry. See
+_fetch_xml_attempt and test_reddit_no_accept_header. For resilience the fetcher
 fails over across two RSS hosts (www.reddit.com, then old.reddit.com) on a
 403/5xx/network error, but never on a 429 (the rate-limit bucket is per-IP and
 shared across hosts). See fetch_xml_resilient + RSS_HOSTS. No HTML scrape, no
@@ -281,10 +289,16 @@ def _fetch_xml_attempt(url: str, timeout: int = 15) -> tuple[str, ET.Element | N
     counted once (as ok) instead of as failed+ok. This is the seam the dual-host
     failover (fetch_xml_resilient) and the single-URL wrapper (fetch_xml) share.
     """
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/atom+xml, application/rss+xml, application/xml, text/xml",
-    }
+    # User-Agent ONLY. Do NOT send an explicit Accept header: as of 2026-06-01
+    # Reddit's edge (Fastly) 403s any keyless RSS GET that carries an Accept
+    # header from a non-browser TLS client, www and old alike, regardless of the
+    # Accept value. The same URL with UA-only returns 200. This is a fingerprint
+    # block, not a transient, so it fails on every retry until the header is
+    # dropped. Omitting Accept sends NO Accept header at all (urllib adds no
+    # default), and the edge returns 200 for that. Note an explicit Accept: */*
+    # is also 403'd, so the trigger is the header's presence, not its value.
+    # See test_reddit_no_accept_header.
+    headers = {"User-Agent": USER_AGENT}
     req = urllib.request.Request(url, headers=headers)
 
     for attempt in range(MAX_RETRIES):

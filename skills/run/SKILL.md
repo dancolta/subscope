@@ -193,13 +193,14 @@ Do NOT call this "blocked" and do NOT suggest any Reddit login, API key, or OAut
 ```
 Could not read Reddit this run. Every feed request was blocked or unreachable.
 
-What this is NOT: this is not a setup or credentials problem. subscope uses Reddit's public RSS feeds and needs no login, no API key, and no account.
+What this is NOT: this is not a setup or credentials problem. subscope uses Reddit's public RSS feeds and needs no login, no API key, and no account. Do not add one.
 
-Likely causes:
-  - a temporary network issue on this machine (check your connection, then re-run)
-  - Reddit's edge throttling this IP for a short window (wait a few minutes, then re-run)
+If a SINGLE re-run a minute later also returns zero feeds, treat it as a real fault, not a blip. When every request fails the same way, it is almost always one of these (in order of likelihood):
+  - subscope is out of date and Reddit's edge changed how it fingerprints requests (the common case). Update the plugin to the latest version and re-run.
+  - a network issue on this machine (check your connection, then re-run once).
+  - Reddit throttling this IP for a short window (wait a few minutes, re-run once).
 
-If it keeps failing across several runs over a day, open an issue: github.com/dancolta/subscope/issues
+Do not keep blindly re-running. If one update + one re-run still returns zero, open an issue with the stderr lines starting `[reddit]`: github.com/dancolta/subscope/issues
 ```
 
 Do NOT, under any circumstances, tell the user to configure Reddit OAuth, add a Reddit API key, or run a Reddit auth setup step. No such step exists. The fetch path is keyless RSS by design.
