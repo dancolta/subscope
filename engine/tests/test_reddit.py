@@ -276,6 +276,34 @@ class _Resp:
         return False
 
 
+def test_reddit_no_accept_header(tmp_path, monkeypatch):
+    """RSS GETs must send User-Agent and NO Accept header. As of 2026-06-01
+    Reddit's edge 403s any keyless RSS request carrying an explicit Accept
+    header (any value) from a non-browser TLS client; UA-only returns 200. This
+    asserts the request the fetcher builds never reintroduces Accept (regression
+    guard for the demo onboarding 403 incident)."""
+    monkeypatch.setenv("SUBSCOPE_CONFIG", str(tmp_path))
+    reddit.reset_fetch_stats()
+    captured = {}
+
+    def _capture(req, *a, **k):
+        # urllib normalizes header keys to .capitalize() form ("Accept",
+        # "User-agent"); check via the case-insensitive has_header/header_items.
+        captured["headers"] = dict(req.header_items())
+        captured["has_accept"] = req.has_header("Accept")
+        return _Resp()
+
+    with patch.object(reddit, "_sleep"):
+        with patch.object(reddit.urllib.request, "urlopen", side_effect=_capture):
+            reddit.fetch_xml("https://www.reddit.com/r/SaaS/new/.rss")
+
+    assert captured["has_accept"] is False, (
+        f"Accept header must not be sent (triggers Reddit 403); got {captured['headers']}"
+    )
+    # User-Agent is still required.
+    assert any(k.lower() == "user-agent" for k in captured["headers"])
+
+
 def test_reset_fetch_stats_zeroes_counters():
     reddit._FETCH_STATS["ok"] = 5
     reddit._FETCH_STATS["failed"] = 3
