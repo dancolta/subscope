@@ -44,11 +44,38 @@ def _resolve_config_dir() -> Path:
 
 CONFIG_DIR = _resolve_config_dir()
 
+# Packaged defaults shipped in the repo `config/` dir. Once onboarding writes
+# subreddits.yml into the XDG dir, _resolve_config_dir activates that dir, but it
+# only holds the files onboarding generates (subreddits/keywords/brand-anchor/
+# example-pains). Base defaults the user is NOT asked to author (weights.yml, and
+# any future shipped default) live here, so _load_yaml falls back to this dir
+# per file. Without the fallback a freshly onboarded profile crashes on the first
+# scan with a missing weights.yml.
+PACKAGED_CONFIG_DIR = Path(__file__).resolve().parent.parent.parent / "config"
+
 
 def _load_yaml(name: str, optional: bool = False) -> dict[str, Any]:
+    """Load a YAML config by name, user dir first then packaged defaults.
+
+    Precedence: the active CONFIG_DIR (the user's XDG dir once onboarded) wins,
+    so user edits always override. A file absent from CONFIG_DIR falls back to
+    the packaged default in PACKAGED_CONFIG_DIR, so base defaults the onboarding
+    synthesizer does not emit (weights.yml) still load. An optional file missing
+    from both returns {}; a required file missing from both raises with a message
+    naming both search dirs.
+    """
     path = CONFIG_DIR / name
-    if not path.exists() and optional:
-        return {}
+    if not path.exists() and CONFIG_DIR != PACKAGED_CONFIG_DIR:
+        fallback = PACKAGED_CONFIG_DIR / name
+        if fallback.exists():
+            path = fallback
+    if not path.exists():
+        if optional:
+            return {}
+        raise FileNotFoundError(
+            f"config {name!r} not found in {CONFIG_DIR} or packaged defaults "
+            f"{PACKAGED_CONFIG_DIR}"
+        )
     with open(path) as f:
         return yaml.safe_load(f) or {}
 
