@@ -1,12 +1,11 @@
 {
-  "name": "subscope-local",
-  "id": "subscope-local",
+  "name": "subscope",
   "owner": {
     "name": "dancolta"
   },
   "metadata": {
-    "description": "Local dev marketplace for subscope plugin",
-    "version": "0.1.0"
+    "description": "Marketplace for the subscope Claude Code plugin",
+    "version": "0.2.0"
   },
   "plugins": [
     {

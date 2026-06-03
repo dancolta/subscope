@@ -22,7 +22,8 @@ Keyless. No OAuth, no API key, no Reddit account. It reads Reddit's public RSS f
 </div>
 
 ```bash
-/plugin install dancolta/subscope
+/plugin marketplace add dancolta/subscope   # register the marketplace (one time)
+/plugin install subscope@subscope           # install the plugin
 /subscope-onboard       # one-time targeting setup (~5 min), ends with your first scan
 /subscope-run           # every scan after that
 ```
