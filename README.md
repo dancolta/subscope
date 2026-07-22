@@ -274,3 +274,7 @@ Config lives at `~/.config/subscope/`. Every file is written with `chmod 600`.
 You find the thread. You write the reply. subscope handles the part that would take you an hour every morning.
 
 MIT licensed, see [LICENSE](LICENSE). Issues and PRs welcome. The anti-positioning surface (no auto-posting, no drafting, no account rotation) is deliberate and load-bearing, so open an issue before proposing write-side Reddit features.
+
+---
+
+> From [NodeSparks](https://www.nodesparks.com) — [custom AI agents & automations](https://www.nodesparks.com/services/custom-ai-agents) for founders who would rather own the tool than rent it. subscope is our open-source buyer-signal scanner.
