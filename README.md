@@ -277,4 +277,4 @@ MIT licensed, see [LICENSE](LICENSE). Issues and PRs welcome. The anti-positioni
 
 ---
 
-> From [NodeSparks](https://www.nodesparks.com) — [custom AI agents & automations](https://www.nodesparks.com/services/custom-ai-agents) for founders who would rather own the tool than rent it. subscope is our open-source buyer-signal scanner.
+> From [NodeSparks](https://www.nodesparks.com) — [custom AI agents & automations](https://www.nodesparks.com/contact-us) for founders who would rather own the tool than rent it. subscope is our open-source buyer-signal scanner.
