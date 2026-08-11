@@ -158,8 +158,21 @@ def _load_configs(mode: str = "default") -> dict[str, Any]:
     brand_cfg = _load_yaml("brand-anchor.yml", optional=True)
     brands = [b for b in (brand_cfg.get("brand_anchor") or []) if isinstance(b, str) and b.strip()]
 
+    # fetch.yml (optional): lets a profile choose HOW it reaches Reddit.
+    #   strategy: new     -> scan each sub's /new feed (default, unchanged)
+    #   strategy: search  -> search each sub for the profile's keywords
+    # Scanning /new answers "what got posted in the last few hours"; searching
+    # answers "who is asking this", over a ~17 day window. A profile built
+    # around an explicit ask ("how do I automate X") needs the second, and
+    # having it in config means the daily run does the right thing with no flag.
+    fetch_cfg = _load_yaml("fetch.yml", optional=True)
+    strategy = str(fetch_cfg.get("strategy") or "new").strip().lower()
+    if strategy not in ("new", "search"):
+        raise ValueError(
+            f"unknown fetch.yml strategy {strategy!r}; valid: 'new', 'search'")
+
     return {"subs": subs, "keywords": keywords, "weights": weights,
-            "brands": brands, "mode": mode}
+            "brands": brands, "mode": mode, "strategy": strategy}
 
 
 def _bucket_keywords(bucket: str, kw: dict[str, Any]) -> list[str]:
@@ -377,6 +390,9 @@ def cmd_fetch_score(
     cfg = _load_configs(mode=mode)
     weights = cfg["weights"]
     brands = cfg.get("brands") or []
+    # A profile can select the search path in fetch.yml, so the daily run does
+    # not depend on the caller remembering --search. The flag still forces it on.
+    search = search or cfg.get("strategy") == "search"
     # Judge-first candidate cap: a safety bound on how many candidates the skill
     # judge reads. Set generously: a daily run fetches well under this, and the
     # judge (Claude) handles dozens of short posts cheaply, so truncation should
@@ -434,12 +450,19 @@ def cmd_fetch_score(
         # budget bounds the run: Reddit's keyless RSS serves ~1 request per
         # 60s window, so an unbounded run is an open-ended one.
         reddit.reset_fetch_stats()
-        reddit.set_request_budget(
-            reddit.DEFAULT_REQUEST_BUDGET if max_requests is None else max_requests
-        )
-        subs_skipped_rate_limit = 0
-
         sub_list = cfg["subs"]
+        # The search path cannot share a feed (every sub gets its own query), so
+        # it costs one request per sub where the /new path costs one per batch.
+        # Size the default budget to the path actually being used, or a profile
+        # with more subs than the flat default would silently lose its tail.
+        if max_requests is not None:
+            budget = max_requests
+        elif SEARCH_STRATEGY.get(mode) is not None or search:
+            budget = len(sub_list) + 3
+        else:
+            budget = reddit.DEFAULT_REQUEST_BUDGET
+        reddit.set_request_budget(budget)
+        subs_skipped_rate_limit = 0
 
         # Batched prefetch for the default /new path. One combined
         # /r/a+b+c/new/.rss request covers a whole batch of subs, which is the

@@ -24,6 +24,22 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _packaged_config(monkeypatch):
+    """Pin config resolution to the repo's packaged config/ for every test.
+
+    cli.CONFIG_DIR resolves at import time, and it resolves to the developer's
+    own ~/.config/subscope whenever that is onboarded. Without this pin the
+    suite silently reads whatever profile the developer happens to have
+    installed, so results differ per machine and a local fetch.yml selecting
+    the search strategy sends CLI tests to the live network. Tests that want
+    their own config dir still patch CONFIG_DIR themselves; this only sets the
+    floor.
+    """
+    from subscope import cli
+    monkeypatch.setattr(cli, "CONFIG_DIR", cli.PACKAGED_CONFIG_DIR)
+
+
+@pytest.fixture(autouse=True)
 def _no_batched_prefetch(monkeypatch, request):
     """Stub the batched multi-sub prefetch out of every test by default.
 

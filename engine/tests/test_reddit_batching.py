@@ -239,3 +239,38 @@ def test_batching_stops_once_a_real_429_drains_the_bucket():
         unfetched = reddit.prime_new_cache([_sub("a"), _sub("b")], cost_cap=1)
     assert m.call_count == 0
     assert set(unfetched) == {"a", "b"}
+
+
+# ─── fetch.yml strategy selection ─────────────────────────────────────
+
+def _write_min_config(d):
+    (d / "subreddits.yml").write_text(
+        "subreddits:\n  - {name: alpha, tier: 1, bucket: operator, weight: 1.0}\n")
+    (d / "keywords.yml").write_text("shared: [automate]\noperator: []\nbuilder: []\n")
+
+
+def test_fetch_strategy_defaults_to_new(tmp_path, monkeypatch):
+    """No fetch.yml means the /new path, unchanged for every existing profile."""
+    from subscope import cli
+    _write_min_config(tmp_path)
+    monkeypatch.setattr(cli, "CONFIG_DIR", tmp_path)
+    assert cli._load_configs()["strategy"] == "new"
+
+
+def test_fetch_strategy_search_is_read_from_config(tmp_path, monkeypatch):
+    from subscope import cli
+    _write_min_config(tmp_path)
+    (tmp_path / "fetch.yml").write_text("strategy: search\n")
+    monkeypatch.setattr(cli, "CONFIG_DIR", tmp_path)
+    assert cli._load_configs()["strategy"] == "search"
+
+
+def test_unknown_fetch_strategy_is_rejected_loudly(tmp_path, monkeypatch):
+    """A typo must fail the run, not silently fall back to /new and quietly
+    return the wrong kind of post for the whole profile."""
+    from subscope import cli
+    _write_min_config(tmp_path)
+    (tmp_path / "fetch.yml").write_text("strategy: serch\n")
+    monkeypatch.setattr(cli, "CONFIG_DIR", tmp_path)
+    with pytest.raises(ValueError, match="serch"):
+        cli._load_configs()
