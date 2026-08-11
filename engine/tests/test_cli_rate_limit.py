@@ -86,35 +86,66 @@ def test_status_blocked_when_all_feeds_fail_non_429(monkeypatch):
 
 
 def test_status_rate_limited_and_partial_results(monkeypatch):
-    """Bucket drains after the first sub: the loop stops, returns partial
-    results, and reports rate_limited with a count of skipped subs."""
-    fetched_subs = []
+    """Bucket drains part-way through the batched prefetch: the run returns the
+    subs it did get, and reports rate_limited with a count of skipped subs.
+
+    The prefetch is where the network work happens on the default path, so a
+    short batch (not a broken loop) is what a drained bucket looks like now.
+    """
+    covered = ["smallbusiness"]
+
+    def fake_prime(subs, **kwargs):
+        # One sub covered before the bucket drained; the rest never fetched.
+        return [str(s["name"]) for s in subs if str(s["name"]) not in covered]
 
     def fake_fetch_delta(sub, last_seen_id, max_limit=50):
-        fetched_subs.append(sub)
-        # First sub yields posts; simulate the bucket draining right after.
+        if sub not in covered:
+            return []
         reddit._FETCH_STATS["ok"] += 1
         return _make_posts(sub, 2)
 
-    # is_rate_limited flips True once at least one sub has been fetched.
+    monkeypatch.setattr(reddit, "prime_new_cache", fake_prime)
     monkeypatch.setattr(reddit, "fetch_delta", fake_fetch_delta)
-    monkeypatch.setattr(reddit, "is_rate_limited", lambda: len(fetched_subs) >= 1)
+    monkeypatch.setattr(reddit, "is_rate_limited", lambda: False)
     # author vet must not hit the network in this test.
     monkeypatch.setattr(reddit, "fetch_user_about", lambda u: None)
     monkeypatch.setattr(reddit, "fetch_user_recent_subs", lambda u, limit=100: {})
 
     payload = _run_fetch_score(limit_per_sub=3, daily_cap=5, no_cool=True)
 
+    assert payload["status"] == "rate_limited"
+    assert payload["subs_skipped_rate_limit"] >= 1
+    assert payload["dropped_counts"]["fetch_rate_limited"] >= 1
+    # Partial, not wholesale-zero: the one covered sub still produced output.
+    assert payload["fetched"] == 2
+    assert payload["subs_scanned"] == 1
+    # fetch_rate_limited is a status marker, kept OUT of the "filtered" footer.
+    assert "posts filtered before scoring" not in payload["inline_table"] or \
+        "rate" not in payload["inline_table"].lower()
+
+
+def test_per_sub_path_still_breaks_when_bucket_drains(monkeypatch):
+    """Search modes fetch per sub (no shared feed), so the mid-loop rate-limit
+    break must still fire there and return partial results."""
+    fetched_subs = []
+
+    def fake_search(sub, mode, strat, keywords, brands, limit):
+        fetched_subs.append(sub["name"])
+        reddit._FETCH_STATS["ok"] += 1
+        return _make_posts(sub["name"], 2)
+
+    monkeypatch.setattr(cli, "_fetch_mode_search", fake_search)
+    monkeypatch.setattr(reddit, "is_rate_limited", lambda: len(fetched_subs) >= 1)
+    monkeypatch.setattr(reddit, "fetch_user_about", lambda u: None)
+    monkeypatch.setattr(reddit, "fetch_user_recent_subs", lambda u, limit=100: {})
+
+    payload = _run_fetch_score(limit_per_sub=3, daily_cap=5, no_cool=True,
+                               mode="churn")
+
     # Exactly one sub fetched before the loop broke.
     assert len(fetched_subs) == 1
     assert payload["status"] == "rate_limited"
     assert payload["subs_skipped_rate_limit"] >= 1
-    assert payload["dropped_counts"]["fetch_rate_limited"] >= 1
-    # Partial, not wholesale-zero: the one fetched sub still produced output.
-    assert payload["fetched"] == 2
-    # fetch_rate_limited is a status marker, kept OUT of the "filtered" footer.
-    assert "posts filtered before scoring" not in payload["inline_table"] or \
-        "rate" not in payload["inline_table"].lower()
 
 
 def test_rate_limited_takes_precedence_over_blocked(monkeypatch):

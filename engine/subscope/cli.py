@@ -357,6 +357,7 @@ def cmd_fetch_score(
     search: bool = False,                   # force the search.rss fetch path even for default mode
     since_days: int | None = None,          # override active mode age window to the last N days
     window: str | None = None,              # override search recency: new|week|month|year|all
+    max_requests: int | None = None,        # per-run Reddit GET ceiling (None = engine default)
 ) -> None:
     """Run the surface pipeline for a specific pattern mode.
 
@@ -429,19 +430,46 @@ def cmd_fetch_score(
         authority_enabled = bool(authority_cfg.get("enabled", False))
 
         # Reset feed counters + rate state so we can classify the run as ok /
-        # rate_limited / blocked (drives the JSON `status` field).
+        # rate_limited / blocked (drives the JSON `status` field). The GET
+        # budget bounds the run: Reddit's keyless RSS serves ~1 request per
+        # 60s window, so an unbounded run is an open-ended one.
         reddit.reset_fetch_stats()
+        reddit.set_request_budget(
+            reddit.DEFAULT_REQUEST_BUDGET if max_requests is None else max_requests
+        )
         subs_skipped_rate_limit = 0
 
         sub_list = cfg["subs"]
+
+        # Batched prefetch for the default /new path. One combined
+        # /r/a+b+c/new/.rss request covers a whole batch of subs, which is the
+        # difference between a run that finishes and one that spends a minute
+        # per sub. fetch_delta below reads the prefetch, so the per-sub call
+        # and its delta contract are unchanged. Search-driven modes hit
+        # search.rss with a per-sub query, so they cannot share a feed and stay
+        # on the per-sub network path.
+        primed = SEARCH_STRATEGY.get(mode) is None and not search
+        if primed:
+            unfetched = reddit.prime_new_cache(
+                sub_list, limit=max(limit_per_sub, reddit.MULTI_FEED_LIMIT))
+            if unfetched:
+                subs_skipped_rate_limit += len(unfetched)
+                sys.stderr.write(
+                    f"[subscope] {len(unfetched)} sub(s) not fetched "
+                    f"(rate limit or request budget): {', '.join(unfetched)}\n"
+                )
+                sys.stderr.flush()
+
         for sub_idx, s in enumerate(sub_list):
-            # Graceful partial results: if the token bucket drained on a prior
-            # sub, stop bursting. Return what we already fetched rather than
-            # hammering into 429s and wholesale-failing the run.
-            if reddit.is_rate_limited():
+            # Graceful partial results on the per-sub network path: if the
+            # bucket drained, stop bursting and return what we already have
+            # rather than hammering into 429s and failing the run wholesale.
+            # The primed path has already done its network work, so breaking
+            # here would only discard posts we already hold in memory.
+            if not primed and reddit.is_rate_limited():
                 subs_skipped_rate_limit += len(sub_list) - sub_idx
                 sys.stderr.write(
-                    f"[subscope] rate-limited mid-run, skipping {subs_skipped_rate_limit} "
+                    f"[subscope] rate-limited mid-run, skipping {len(sub_list) - sub_idx} "
                     f"remaining sub(s); returning partial results\n"
                 )
                 sys.stderr.flush()
@@ -763,6 +791,8 @@ def cmd_fetch_score(
         "buyer_count": len(selected),
         "authority_count": len(authority_selected),
         "subs_skipped_rate_limit": subs_skipped_rate_limit,
+        "subs_scanned": len(sub_list) - subs_skipped_rate_limit,
+        "reddit_requests": reddit.requests_used(),
         "fetch_stats": fetch_stats,
         "dropped_counts": dropped_counts,
         "notes": notes,
@@ -1054,6 +1084,10 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("orient", help="Print first-launch welcome + fork message")
     fs = sub.add_parser("fetch-score", help="Fetch deltas, gate, score, surface")
     fs.add_argument("--limit-per-sub", type=int, default=25)
+    fs.add_argument("--max-requests", type=int, default=None,
+                    help="Per-run Reddit GET ceiling. Reddit's keyless RSS serves "
+                         "~1 request per 60s window, so this is also the run's "
+                         "worst-case minutes (default: engine default)")
     fs.add_argument("--daily-cap", type=int, default=None,
                     help="Override pattern-specific cap (default: read from weights.yml pattern_caps)")
     fs.add_argument("--no-cool", action="store_true",
@@ -1133,6 +1167,7 @@ def main(argv: list[str] | None = None) -> None:
             search=args.search,
             since_days=args.since_days,
             window=args.window,
+            max_requests=args.max_requests,
         )
     elif args.cmd == "op-vet":
         cmd_op_vet(args.username)

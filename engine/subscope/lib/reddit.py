@@ -82,6 +82,33 @@ MIN_REQUEST_INTERVAL = 1.6
 RATELIMIT_REMAINING_FLOOR = 2.0
 MAX_RATELIMIT_PAUSE = 60.0
 
+# Observed 2026-08-11: the keyless RSS bucket is ONE request per ~60s window,
+# per IP, shared across www and old.reddit (verified: a second GET to either
+# host inside the window is a hard 429). Every 200 therefore reports
+# `x-ratelimit-remaining: 0` / `used: 1`, which is NOT a fault, it is the
+# steady state. Two consequences drive the design below:
+#
+#  1. remaining=0 on a 200 must never be treated as a terminal "drained" state.
+#     The pause until reset IS the remedy; after it the bucket has refilled.
+#     Only a 429 that survives every retry is a real stop signal.
+#  2. One request per minute makes per-sub feeds unaffordable (a 10-sub run
+#     would idle for 10 minutes). Subs are batched into combined
+#     /r/a+b+c/new/.rss feeds, which Reddit serves in a SINGLE request with
+#     every entry tagged by its source sub via <category term>.
+#
+# BATCH_COST_CAP: how much feed volume one combined request is asked to carry.
+#   Costs come from each sub's `saturation`, so a busy sub does not crowd a
+#   quiet one out of the shared 100-entry page.
+# DEFAULT_REQUEST_BUDGET: hard ceiling on Reddit GETs per run. At ~1 request
+#   per minute this is also the run's worst-case wall-clock in minutes, so it
+#   is what keeps a run bounded instead of open-ended. Sub feeds draw first;
+#   best-effort callers (the author vet) fail open once it is spent.
+BATCH_COST_CAP = 6
+SATURATION_COST = {"high": 3, "medium": 2, "low": 1}
+DEFAULT_SATURATION_COST = 2
+MULTI_FEED_LIMIT = 100
+DEFAULT_REQUEST_BUDGET = 8
+
 # Reddit search `q` safe cap. Longer queries are truncated at a word boundary
 # before URL-encoding (search.rss rejects over-long queries). Allowlists keep
 # caller-supplied sort/timeframe values off the URL unless they are valid.
@@ -119,6 +146,15 @@ def _log(msg: str) -> None:
 _FETCH_STATS = {"ok": 0, "failed": 0, "rate_limited": 0, "fallback_used": 0}
 _RATE_STATE = {"drained": False}
 
+# Per-run Reddit GET budget. `limit` None means unlimited (the default outside
+# a fetch batch, so single-post helpers and tests are unaffected).
+_BUDGET: dict[str, int | None] = {"limit": None, "used": 0}
+
+# Posts held from a batched multi-sub prefetch, keyed by sub. fetch_delta reads
+# this before touching the network, so the batching stays behind the existing
+# per-sub call and callers keep their contract.
+_PREFETCH: dict[str, list[dict[str, Any]]] = {}
+
 # Ordered RSS hosts for the dual-host 403 failover (SS-104). Both return 200 for
 # keyless RSS today; serving the same Atom shape, so one parser covers both. www
 # is primary; old.reddit is the failover when www returns 403/5xx/network (NOT on
@@ -132,12 +168,55 @@ _last_request_at = 0.0
 
 
 def reset_fetch_stats() -> None:
-    """Zero the per-run feed counters and rate state. Call before a fetch batch."""
+    """Zero the per-run feed counters, rate state, and GET budget.
+
+    Clears the budget back to unlimited so a spent budget can never leak from
+    one batch into the next (or into a later command in the same process) and
+    silently suppress its requests. Callers that want a ceiling call
+    set_request_budget right after this.
+    """
     _FETCH_STATS["ok"] = 0
     _FETCH_STATS["failed"] = 0
     _FETCH_STATS["rate_limited"] = 0
     _FETCH_STATS["fallback_used"] = 0
     _RATE_STATE["drained"] = False
+    _BUDGET["limit"] = None
+    _BUDGET["used"] = 0
+    _PREFETCH.clear()
+
+
+def set_request_budget(limit: int | None) -> None:
+    """Cap Reddit GETs for this run and zero the counter. None = unlimited.
+
+    At ~1 request per 60s window the budget doubles as the run's worst-case
+    wall-clock in minutes, which is what keeps a run bounded rather than
+    open-ended. Call once, alongside reset_fetch_stats.
+    """
+    _BUDGET["limit"] = None if limit is None else max(0, int(limit))
+    _BUDGET["used"] = 0
+
+
+def requests_used() -> int:
+    """Reddit GETs made since the last set_request_budget call."""
+    return int(_BUDGET["used"] or 0)
+
+
+def budget_remaining() -> int | None:
+    """GETs left in this run's budget, or None when unlimited."""
+    limit = _BUDGET["limit"]
+    if limit is None:
+        return None
+    return max(0, limit - int(_BUDGET["used"] or 0))
+
+
+def budget_exhausted() -> bool:
+    """True once the per-run GET budget is spent.
+
+    Best-effort callers (the author vet) check this and fail open instead of
+    stretching the run by another minute per lookup.
+    """
+    remaining = budget_remaining()
+    return remaining is not None and remaining <= 0
 
 
 def get_fetch_stats() -> dict[str, int]:
@@ -171,20 +250,27 @@ def _throttle() -> None:
 
 
 def _ratelimit_pause_from_headers(headers: Any) -> None:
-    """Read x-ratelimit-remaining / x-ratelimit-reset from a 200 response and
-    pause until reset when the bucket is nearly empty, so we never burst into a
-    429. Flips the drained flag so the caller can stop early. Capped wait."""
+    """Read x-ratelimit-remaining / x-ratelimit-reset off a 200 and pause until
+    the bucket refills, so the NEXT GET does not 429.
+
+    This runs on a SUCCESSFUL response, so it is pacing, not failure. Reddit's
+    keyless bucket reports remaining=0 on the first 200 of every window, so
+    treating that as terminal would end every run after one request. The pause
+    is the remedy: once it returns, the window has rolled over and the bucket
+    has refilled, so any earlier drained flag is cleared here.
+    """
     if headers is None:
+        _RATE_STATE["drained"] = False
         return
     remaining = _header_float(headers, "x-ratelimit-remaining")
-    if remaining is None:
-        return
-    if remaining <= RATELIMIT_REMAINING_FLOOR:
-        _RATE_STATE["drained"] = True
+    if remaining is not None and remaining <= RATELIMIT_REMAINING_FLOOR:
         reset = _header_float(headers, "x-ratelimit-reset")
         pause = min(reset, MAX_RATELIMIT_PAUSE) if reset and reset > 0 else MIN_REQUEST_INTERVAL
-        _log(f"ratelimit low (remaining={remaining}), pausing {pause:.1f}s until reset")
+        _log(f"ratelimit low (remaining={remaining}), pacing {pause:.1f}s until reset")
         _sleep(pause)
+    # A 200 means the host is serving us. Clear any drained flag left by an
+    # earlier 429 that a retry has now recovered from.
+    _RATE_STATE["drained"] = False
 
 
 def _header_float(headers: Any, name: str) -> float | None:
@@ -284,7 +370,7 @@ def fetch_json(url: str, timeout: int = 15) -> dict[str, Any] | None:
 
 def _fetch_xml_attempt(url: str, timeout: int = 15) -> tuple[str, ET.Element | None]:
     """Single-URL RSS/Atom GET. Returns one of:
-      ("ok", root) | ("rate_limited", None) | ("failed", None)
+      ("ok", root) | ("rate_limited", None) | ("failed", None) | ("budget", None)
 
     Does the per-request work (throttle spacing, 429 retry/backoff, x-ratelimit
     header pacing) but does NOT touch the per-sub OUTCOME counters. The CALLER
@@ -305,6 +391,13 @@ def _fetch_xml_attempt(url: str, timeout: int = 15) -> tuple[str, ET.Element | N
     req = urllib.request.Request(url, headers=headers)
 
     for attempt in range(MAX_RETRIES):
+        # Retries are real GETs against the same per-IP bucket, so they are
+        # charged to the budget too. "budget" is distinct from "failed": no
+        # request was made, so it must not count as a reachability failure.
+        if budget_exhausted():
+            _log("request budget spent, skipping GET")
+            return ("budget", None)
+        _BUDGET["used"] = int(_BUDGET["used"] or 0) + 1
         _throttle()  # proactive inter-request spacing, every attempt
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
@@ -355,6 +448,9 @@ def fetch_xml(url: str, timeout: int = 15) -> ET.Element | None:
     if status == "rate_limited":
         _FETCH_STATS["rate_limited"] += 1
         return None
+    if status == "budget":
+        # No request left the machine, so this is neither ok nor a failure.
+        return None
     _FETCH_STATS["failed"] += 1
     return None
 
@@ -387,6 +483,10 @@ def fetch_xml_resilient(path: str, timeout: int = 15) -> ET.Element | None:
         if status == "rate_limited":
             _RATE_STATE["drained"] = True
             _FETCH_STATS["rate_limited"] += 1
+            return None
+        if status == "budget":
+            # Budget spent: do not try the failover host (it draws from the
+            # same per-IP bucket) and do not count a reachability failure.
             return None
         # failed: try the next host
     _FETCH_STATS["failed"] += 1
@@ -713,8 +813,26 @@ def _fetch_delta_public(sub: str, last_seen_id: str | None,
                         max_limit: int = 50) -> list[dict[str, Any]]:
     """RSS path for fetch_delta. The Atom feed is a single newest-first page,
     so we fetch once, stop at last_seen_id, skip removed/locked, and cap at
-    max_limit. Returns newest-first."""
+    max_limit. Returns newest-first.
+
+    Serves from the batched prefetch when prime_new_cache already pulled this
+    sub, which is the normal daily path and costs no request.
+    """
+    key = _normalize_sub(sub)
+    if key in _PREFETCH:
+        return delta_from_posts(_PREFETCH[key], last_seen_id, max_limit=max_limit)
     posts = fetch_subreddit_new(sub, limit=min(max_limit, 100))
+    return delta_from_posts(posts, last_seen_id, max_limit=max_limit)
+
+
+def delta_from_posts(posts: list[dict[str, Any]], last_seen_id: str | None,
+                     max_limit: int = 50) -> list[dict[str, Any]]:
+    """Apply the delta cut to an already-fetched, newest-first post list.
+
+    Same contract as the tail of _fetch_delta_public (stop at last_seen_id,
+    skip removed/locked, cap at max_limit), split out so the batched
+    multi-sub path can reuse it without a per-sub request.
+    """
     collected: list[dict[str, Any]] = []
     for p in posts:
         if last_seen_id and p["id"] == last_seen_id:
@@ -725,6 +843,116 @@ def _fetch_delta_public(sub: str, last_seen_id: str | None,
         if len(collected) >= max_limit:
             break
     return collected
+
+
+# ─── Batched multi-sub fetch (the rate-limit workaround) ──────────────
+
+def plan_sub_batches(subs: list[dict[str, Any]],
+                     cost_cap: int = BATCH_COST_CAP) -> list[list[dict[str, Any]]]:
+    """Group subs into combined-feed batches, packing greedily by saturation.
+
+    A combined feed returns ONE shared page of ~100 newest entries across its
+    subs, so a high-saturation sub posted into the same batch as three quiet
+    ones will crowd them out of the page entirely. Each sub is charged a cost
+    from its `saturation` and a batch is closed at cost_cap, which keeps every
+    sub in a batch with real room on the page. Config order is preserved so the
+    highest-weight (tier 1) subs land in the earliest batches, which is what
+    survives if the request budget runs out mid-run.
+    """
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_cost = 0
+    for s in subs:
+        cost = SATURATION_COST.get(str(s.get("saturation") or "").lower(),
+                                   DEFAULT_SATURATION_COST)
+        # A single sub over the cap still gets its own batch rather than none.
+        if current and current_cost + cost > cost_cap:
+            batches.append(current)
+            current, current_cost = [], 0
+        current.append(s)
+        current_cost += cost
+    if current:
+        batches.append(current)
+    return batches
+
+
+def fetch_multi_new(sub_names: list[str], limit: int = MULTI_FEED_LIMIT,
+                    timeout: int = 20) -> dict[str, list[dict[str, Any]]] | None:
+    """Fetch /r/<a+b+c>/new/.rss in ONE request, split back out per sub.
+
+    Reddit serves a combined subreddit feed as a single Atom document whose
+    entries each carry <category term="<sub>">, so one request covers the whole
+    batch. Returns {sub_name: [posts newest-first]} with an entry for every
+    requested sub (empty list when the page carried none of its posts), or None
+    when the feed was unreachable, so the caller can tell that apart from a
+    genuinely quiet batch.
+    """
+    names = [_normalize_sub(n) for n in sub_names if _normalize_sub(n)]
+    if not names:
+        return {}
+    encoded = "+".join(urllib.parse.quote(n, safe="") for n in names)
+    path = f"/r/{encoded}/new/.rss?limit={int(limit)}"
+
+    root = fetch_xml_resilient(path, timeout=timeout)
+    if root is None:
+        return None
+
+    # Case-insensitive index: the <category term> casing follows the sub's
+    # canonical spelling, which need not match how it is written in config.
+    by_sub: dict[str, list[dict[str, Any]]] = {n: [] for n in names}
+    lookup = {n.lower(): n for n in names}
+    for entry in root.findall(f"{_ATOM_NS}entry"):
+        p = parse_atom_entry(entry)
+        if not p:
+            continue
+        key = lookup.get(str(p.get("subreddit") or "").lower())
+        if key is not None:
+            by_sub[key].append(p)
+    return by_sub
+
+
+def fetch_new_batched(
+    subs: list[dict[str, Any]], limit: int = MULTI_FEED_LIMIT,
+    cost_cap: int = BATCH_COST_CAP,
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    """Fetch every sub's /new feed using as few requests as batching allows.
+
+    Returns (posts_by_sub, unfetched_sub_names). A sub lands in the second list
+    only when no request was made for it or its batch was unreachable, so the
+    caller can report it as skipped rather than as quiet. Stops early and
+    reports the rest as unfetched once the budget is spent or a real 429 has
+    drained the bucket.
+    """
+    by_sub: dict[str, list[dict[str, Any]]] = {}
+    unfetched: list[str] = []
+    batches = plan_sub_batches(subs, cost_cap=cost_cap)
+    for i, batch in enumerate(batches):
+        names = [str(s["name"]) for s in batch]
+        if budget_exhausted() or is_rate_limited():
+            unfetched.extend(names)
+            continue
+        _log(f"batch {i + 1}/{len(batches)}: r/{'+'.join(names)}")
+        result = fetch_multi_new(names, limit=limit)
+        if result is None:
+            unfetched.extend(names)
+            continue
+        by_sub.update(result)
+    return by_sub, unfetched
+
+
+def prime_new_cache(subs: list[dict[str, Any]], limit: int = MULTI_FEED_LIMIT,
+                    cost_cap: int = BATCH_COST_CAP) -> list[str]:
+    """Batch-fetch every sub's /new feed up front so fetch_delta needs no request.
+
+    Returns the names of subs no request covered (batch unreachable, bucket
+    drained, or budget spent) so the caller can report them as skipped rather
+    than as quiet. Subs that WERE fetched but had no new posts are absent from
+    this list and correctly read as quiet.
+    """
+    _PREFETCH.clear()
+    by_sub, unfetched = fetch_new_batched(subs, limit=limit, cost_cap=cost_cap)
+    _PREFETCH.update(by_sub)
+    return unfetched
 
 
 # ─── Public API ──────────────────────────────────────────────────────

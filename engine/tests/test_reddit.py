@@ -394,7 +394,9 @@ def test_fetch_xml_429_sets_rate_limited_not_blocked(tmp_path, monkeypatch):
 
 def test_fetch_xml_429_then_success_recovers(tmp_path, monkeypatch):
     """A 429 on the first attempt, then a 200, should succeed (count ok) after a
-    bounded backoff. drained still flips (caller decides whether to slow down)."""
+    bounded backoff, and CLEAR drained: the retry recovered, so the caller has
+    no reason to stop. Leaving drained set here aborted the rest of a run over
+    a 429 that had already resolved itself."""
     monkeypatch.setenv("SUBSCOPE_CONFIG", str(tmp_path))
     reddit.reset_fetch_stats()
     reddit._last_request_at = 0.0
@@ -414,7 +416,7 @@ def test_fetch_xml_429_then_success_recovers(tmp_path, monkeypatch):
             root = reddit.fetch_xml("https://www.reddit.com/r/SaaS/new/.rss")
     assert root is not None
     assert reddit.get_fetch_stats()["ok"] == 1
-    assert reddit.is_rate_limited() is True  # the 429 was observed
+    assert reddit.is_rate_limited() is False  # the retry recovered
 
 
 def test_retry_after_delay_prefers_retry_after_then_reset_then_caps():
@@ -430,8 +432,13 @@ def test_retry_after_delay_prefers_retry_after_then_reset_then_caps():
 
 
 def test_header_aware_pause_when_bucket_low(tmp_path, monkeypatch):
-    """A 200 whose x-ratelimit-remaining is at/under the floor triggers a pause
-    until reset (capped) and flips drained, so the next GET does not 429."""
+    """A 200 whose x-ratelimit-remaining is at/under the floor pauses until
+    reset (capped) so the next GET does not 429, and does NOT flip drained.
+
+    Reddit's keyless bucket reports remaining=0 on the first 200 of every
+    window, so treating that as terminal ended every run after one request.
+    The pause is the remedy; the run continues after it.
+    """
     monkeypatch.setenv("SUBSCOPE_CONFIG", str(tmp_path))
     reddit.reset_fetch_stats()
     reddit._last_request_at = 0.0
@@ -441,7 +448,7 @@ def test_header_aware_pause_when_bucket_low(tmp_path, monkeypatch):
     with patch.object(reddit.urllib.request, "urlopen", return_value=resp):
         root = reddit.fetch_xml("https://www.reddit.com/r/SaaS/new/.rss")
     assert root is not None
-    assert reddit.is_rate_limited() is True
+    assert reddit.is_rate_limited() is False
     # The reset-driven pause (30s) should be among the sleeps and within cap.
     assert any(abs(s - 30.0) < 1e-6 for s in slept)
     assert all(s <= reddit.MAX_RATELIMIT_PAUSE for s in slept)

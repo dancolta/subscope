@@ -137,6 +137,15 @@ def vet_author(
     if cached:
         return cached
 
+    # Budget fail-open. The audience histogram costs one Reddit GET, and the
+    # keyless bucket serves ~1 GET per 60s window, so vetting past the run's
+    # budget would add a minute per uncached author. Sub feeds are the priority
+    # consumer; the vet degrades open exactly as it does for an unreachable
+    # feed. Deliberately NOT cached: a skip is not a verdict, and caching it
+    # would suppress the real vet for the 7-day TTL.
+    if reddit.budget_exhausted():
+        return _result("pass", "budget_exhausted", 0, 0, 0.0, False)
+
     min_age_days, min_karma, max_wrong_frac = _load_thresholds(weights)
 
     # Karma/age fetch. None today (about.json 403s). When present, the age/karma
