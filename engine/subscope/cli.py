@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -171,8 +172,25 @@ def _load_configs(mode: str = "default") -> dict[str, Any]:
         raise ValueError(
             f"unknown fetch.yml strategy {strategy!r}; valid: 'new', 'search'")
 
+    # since_days (optional): the profile's own lookback, so a run on a fixed
+    # schedule covers exactly the gap since the last one. A profile scanned
+    # twice a week needs a window at least as long as its LONGEST gap, or the
+    # run after the long gap silently misses posts. --since-days still wins.
+    raw_since = fetch_cfg.get("since_days")
+    since_days_cfg: int | None = None
+    if raw_since is not None:
+        try:
+            since_days_cfg = int(raw_since)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"fetch.yml since_days must be a whole number of days, got {raw_since!r}")
+        if since_days_cfg < 1:
+            raise ValueError(
+                f"fetch.yml since_days must be >= 1, got {since_days_cfg}")
+
     return {"subs": subs, "keywords": keywords, "weights": weights,
-            "brands": brands, "mode": mode, "strategy": strategy}
+            "brands": brands, "mode": mode, "strategy": strategy,
+            "since_days": since_days_cfg}
 
 
 def _bucket_keywords(bucket: str, kw: dict[str, Any]) -> list[str]:
@@ -390,9 +408,12 @@ def cmd_fetch_score(
     cfg = _load_configs(mode=mode)
     weights = cfg["weights"]
     brands = cfg.get("brands") or []
-    # A profile can select the search path in fetch.yml, so the daily run does
-    # not depend on the caller remembering --search. The flag still forces it on.
+    # A profile can select the search path and its lookback in fetch.yml, so a
+    # scheduled run does not depend on the caller remembering flags. An explicit
+    # flag still wins over config in both cases.
     search = search or cfg.get("strategy") == "search"
+    if since_days is None:
+        since_days = cfg.get("since_days")
     # Judge-first candidate cap: a safety bound on how many candidates the skill
     # judge reads. Set generously: a daily run fetches well under this, and the
     # judge (Claude) handles dozens of short posts cheaply, so truncation should
@@ -1147,6 +1168,16 @@ def main(argv: list[str] | None = None) -> None:
     ov = sub.add_parser("op-vet", help="Score a Reddit OP profile (utility, one-shot)")
     ov.add_argument("username", type=str)
 
+    ms = sub.add_parser("mark-surfaced",
+                        help="Record post ids as surfaced so later runs skip them")
+    ms.add_argument("post_ids", nargs="+", type=str,
+                    help="Reddit post ids (no t3_ prefix), as emitted in candidates[]")
+    ms.add_argument("--run-id", type=int, default=None,
+                    help="Attach to an existing run id (default: open a new one)")
+    ms.add_argument("--tier", type=int, default=1)
+    ms.add_argument("--state", type=str, default="hot", choices=["hot", "drafting"],
+                    help="Already judged and shown, so 'hot' (no cooling) is the default")
+
     dc = sub.add_parser("discover", help="Live subreddit discovery from interview answers")
     dc.add_argument("--answers-json", type=str, required=True,
                     help="JSON object with keys what_offering, who_to_reach, pain_quote. "
@@ -1194,6 +1225,9 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.cmd == "op-vet":
         cmd_op_vet(args.username)
+    elif args.cmd == "mark-surfaced":
+        cmd_mark_surfaced(args.post_ids, run_id=args.run_id,
+                          tier=args.tier, state=args.state)
     elif args.cmd == "discover":
         cmd_discover(args.answers_json, args.homepage, args.vertical,
                      args.competitors, args.fresh_window_hours,
@@ -1222,6 +1256,49 @@ def _emit_max_surfaces_warning(n: int) -> None:
         f"80% past position 10 (Nielsen Norman). Plan ~1 min per surface.\n"
     )
     sys.stderr.flush()
+
+
+def cmd_mark_surfaced(post_ids: list[str], run_id: int | None = None,
+                      tier: int = 1, state: str = "hot") -> None:
+    """Record posts as surfaced so a later run does not show them again.
+
+    The engine writes its OWN lexical-gate picks to the surfaced table during
+    fetch-score, but under judge-first the surfacing decision belongs to the
+    skill, and those picks were never recorded. On a profile whose lookback
+    window overlaps its run gap (any fixed schedule does), that means the same
+    threads come back every run. This is the write-back the skill calls after
+    it renders, closing that loop.
+
+    Idempotent: an id already in the table is skipped, not re-inserted, so a
+    re-run or a double call is harmless.
+
+    `surfaced.post_id` has a foreign key into `posts`, and fetch-score only
+    persists the posts IT selected, so a judge-selected post usually has no row
+    yet. We insert a minimal dedup stub first, with the canonical URL derived
+    from the id (which is exact, post ids are globally unique) and the fields we
+    cannot know left empty rather than invented. insert_post is INSERT OR
+    IGNORE, so a post already persisted by a run keeps its real row untouched.
+    """
+    marked, skipped = 0, 0
+    with store.connect() as conn:
+        rid = run_id if run_id is not None else store.start_run(conn)
+        for post_id in post_ids:
+            pid = re.sub(r"^t3_", "", (post_id or "").strip())
+            if not pid:
+                continue
+            if store.already_surfaced(conn, pid):
+                skipped += 1
+                continue
+            canon = reddit.canonical_url({"id": pid})
+            store.insert_post(conn, {
+                "id": pid, "subreddit": "", "title": "",
+                "url": canon, "canonical_url": canon, "author": "",
+                "created_utc": 0, "score": 0, "num_comments": 0, "body": "",
+            })
+            store.mark_surfaced(conn, pid, rid, tier, state=state)
+            marked += 1
+        store.finish_run(conn, rid, 0, marked, "mark-surfaced")
+    print(json.dumps({"status": "ok", "marked": marked, "skipped": skipped}))
 
 
 def cmd_discover(answers_json: str, homepage: str, vertical: str | None,

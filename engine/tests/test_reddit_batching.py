@@ -274,3 +274,31 @@ def test_unknown_fetch_strategy_is_rejected_loudly(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "CONFIG_DIR", tmp_path)
     with pytest.raises(ValueError, match="serch"):
         cli._load_configs()
+
+
+def test_since_days_is_read_from_config(tmp_path, monkeypatch):
+    from subscope import cli
+    _write_min_config(tmp_path)
+    (tmp_path / "fetch.yml").write_text("strategy: search\nsince_days: 5\n")
+    monkeypatch.setattr(cli, "CONFIG_DIR", tmp_path)
+    assert cli._load_configs()["since_days"] == 5
+
+
+def test_since_days_absent_is_none(tmp_path, monkeypatch):
+    """No since_days means the mode keeps its own window, unchanged."""
+    from subscope import cli
+    _write_min_config(tmp_path)
+    monkeypatch.setattr(cli, "CONFIG_DIR", tmp_path)
+    assert cli._load_configs()["since_days"] is None
+
+
+def test_bad_since_days_is_rejected_loudly(tmp_path, monkeypatch):
+    """A window that silently fails to apply would quietly widen the scan back
+    to 17 days and re-show old threads, which looks like bad targeting."""
+    from subscope import cli
+    _write_min_config(tmp_path)
+    monkeypatch.setattr(cli, "CONFIG_DIR", tmp_path)
+    for bad in ("soon", "0", "-3"):
+        (tmp_path / "fetch.yml").write_text(f"since_days: {bad}\n")
+        with pytest.raises(ValueError, match="since_days"):
+            cli._load_configs()
