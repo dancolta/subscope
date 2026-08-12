@@ -495,17 +495,22 @@ def fetch_xml_resilient(path: str, timeout: int = 15) -> ET.Element | None:
 
 def _retry_after_delay(err: urllib.error.HTTPError, attempt: int) -> float:
     """Backoff delay for a 429. Prefer Retry-After, then x-ratelimit-reset, else
-    exponential. Always capped at MAX_RATELIMIT_PAUSE so a bogus header value can
-    never hang the run."""
-    delay = BASE_BACKOFF * (2 ** attempt)
+    wait out a full window. Always capped at MAX_RATELIMIT_PAUSE so a bogus
+    header value can never hang the run.
+
+    The no-header fallback is a FULL WINDOW, not exponential-from-2s. The bucket
+    refills once per ~60s window, so 2s / 4s / 8s retries all land inside the
+    window that just rejected us and are guaranteed to fail, burning three
+    requests from the run's budget to learn nothing. Observed live 2026-08-11:
+    a sub lost all three retries this way and dropped out of the run.
+    """
     hdrs = getattr(err, "headers", None)
     retry_after = _header_float(hdrs, "Retry-After")
     if retry_after is not None and retry_after > 0:
         delay = retry_after
     else:
         reset = _header_float(hdrs, "x-ratelimit-reset")
-        if reset is not None and reset > 0:
-            delay = reset
+        delay = reset if reset is not None and reset > 0 else MAX_RATELIMIT_PAUSE
     return min(delay, MAX_RATELIMIT_PAUSE)
 
 

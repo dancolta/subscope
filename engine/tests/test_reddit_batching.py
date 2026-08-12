@@ -302,3 +302,16 @@ def test_bad_since_days_is_rejected_loudly(tmp_path, monkeypatch):
         (tmp_path / "fetch.yml").write_text(f"since_days: {bad}\n")
         with pytest.raises(ValueError, match="since_days"):
             cli._load_configs()
+
+
+def test_429_without_headers_waits_a_full_window():
+    """2s/4s/8s retries all land inside the 60s window that just rejected us,
+    so they are guaranteed to fail and burn 3 requests from the budget."""
+    err = reddit.urllib.error.HTTPError("u", 429, "Too Many", {}, None)
+    for attempt in range(reddit.MAX_RETRIES):
+        assert reddit._retry_after_delay(err, attempt) == reddit.MAX_RATELIMIT_PAUSE
+
+
+def test_429_still_prefers_retry_after_header():
+    err = reddit.urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "12"}, None)
+    assert reddit._retry_after_delay(err, 0) == 12.0
