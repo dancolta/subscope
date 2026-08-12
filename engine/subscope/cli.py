@@ -1279,12 +1279,22 @@ def cmd_mark_surfaced(post_ids: list[str], run_id: int | None = None,
     cannot know left empty rather than invented. insert_post is INSERT OR
     IGNORE, so a post already persisted by a run keeps its real row untouched.
     """
+    # Split on whitespace and validate. Reddit ids are base36, so anything else
+    # is a caller mistake: zsh does not word-split an unquoted "$IDS", which
+    # silently delivers all the ids as ONE argument. Storing that verbatim would
+    # poison the dedup table with a row that can never match a real post and
+    # would leave every id in it un-deduped.
+    tokens = [t for raw in post_ids for t in (raw or "").split()]
     marked, skipped = 0, 0
+    invalid: list[str] = []
     with store.connect() as conn:
         rid = run_id if run_id is not None else store.start_run(conn)
-        for post_id in post_ids:
-            pid = re.sub(r"^t3_", "", (post_id or "").strip())
+        for token in tokens:
+            pid = re.sub(r"^t3_", "", token.strip())
             if not pid:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9]{1,16}", pid):
+                invalid.append(token)
                 continue
             if store.already_surfaced(conn, pid):
                 skipped += 1
@@ -1298,7 +1308,14 @@ def cmd_mark_surfaced(post_ids: list[str], run_id: int | None = None,
             store.mark_surfaced(conn, pid, rid, tier, state=state)
             marked += 1
         store.finish_run(conn, rid, 0, marked, "mark-surfaced")
-    print(json.dumps({"status": "ok", "marked": marked, "skipped": skipped}))
+    if invalid:
+        sys.stderr.write(
+            f"[cli] ignored {len(invalid)} value(s) that are not Reddit post ids: "
+            f"{', '.join(invalid[:5])}\n"
+        )
+        sys.stderr.flush()
+    print(json.dumps({"status": "ok", "marked": marked,
+                      "skipped": skipped, "invalid": invalid}))
 
 
 def cmd_discover(answers_json: str, homepage: str, vertical: str | None,

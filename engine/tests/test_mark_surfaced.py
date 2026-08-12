@@ -53,3 +53,30 @@ def test_is_idempotent():
 def test_ignores_blank_ids():
     out = _run(["abc123", "", "   "])
     assert out["marked"] == 1
+
+def test_space_joined_ids_are_split_not_stored_whole():
+    """zsh does not word-split an unquoted "$IDS", so all ids arrive as ONE
+    argument. Storing that verbatim poisons dedup with a row no post can match
+    and leaves every id in it un-deduped."""
+    out = _run(["abc123 def456 ghi789"])
+    assert out["marked"] == 3
+    with store.connect() as conn:
+        assert store.already_surfaced(conn, "def456")
+
+
+def test_non_id_values_are_rejected_not_stored():
+    """A pasted URL is the likely mistake. Reddit ids are base36, so anything
+    carrying a slash, colon or punctuation can never match a real post."""
+    out = _run(["abc123", "https://reddit.com/r/x/comments/abc/", "not-an-id"])
+    assert out["marked"] == 1
+    assert len(out["invalid"]) == 2
+    with store.connect() as conn:
+        assert store.already_surfaced(conn, "abc123")
+
+
+def test_t3_prefix_is_stripped():
+    """candidates[] carries bare ids, but the Atom feed uses t3_. Both must
+    land on the same row or dedup silently misses."""
+    _run(["t3_abc123"])
+    with store.connect() as conn:
+        assert store.already_surfaced(conn, "abc123")
